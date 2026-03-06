@@ -393,6 +393,80 @@ dotnet pack src/LiteSql/LiteSql.csproj -c Release -o ./nupkg
 dotnet pack src/LiteSql.CodeGen/LiteSql.CodeGen.csproj -c Release -o ./nupkg
 ```
 
+## Limitations & Known Gaps
+
+LiteSql is designed as a **lightweight L2S replacement**, not a full-featured ORM like Entity Framework. Below are features that LiteSql **does not support**:
+
+### Not Supported
+
+| Category | Feature | Description |
+|---|---|---|
+| **Schema** | Migration | No `Add-Migration` / `Update-Database`. Schema managed externally (SQL scripts, SSMS). CodeGen is DB → Code only |
+| **Performance** | Bulk Insert | No `SqlBulkCopy` wrapper. `InsertOnSubmit` inserts one row at a time |
+| **Performance** | Split Query | No `AsSplitQuery()`. `Include()` uses batch IN queries (good enough for most cases) |
+| **LINQ** | Full LINQ Provider | Only `Where`, `FirstOrDefault`, `Any`, `Count`. No `Select`, `OrderBy`, `GroupBy`, `Join`, `Skip/Take` |
+| **Transaction** | Transaction Helpers | Has basic `db.Transaction` + auto-transaction in `SubmitChanges`. No `ExecuteInTransaction(action)`, `SavePoint`, or `TransactionScope` |
+| **ORM** | Graph Insert/Update | Cannot insert/update an entire object graph (parent + children) in one call |
+| **ORM** | Collection Navigation | FK navigation is parent-only (many-to-one). No `Order.OrderDetails` (one-to-many) collections |
+| **ORM** | ChangeTracker API | Has snapshot-based update tracking, but no `ChangeTracker.Entries()` to query entity states at runtime |
+| **ORM** | Interceptors / Hooks | No `SaveChanges` interceptors, query filters, or soft-delete hooks |
+| **ORM** | Lazy Loading | No proxy-based or explicit lazy loading |
+
+### By Design (Won't Implement)
+
+| Feature | Reason |
+|---|---|
+| Full IQueryable Provider | Complexity too high. Use `ExecuteQuery<T>()` for complex queries |
+| Database-first Migration | Use SQL scripts or external tools (DbUp, FluentMigrator) |
+| Global Query Filters | Can be worked around with `Where()` or raw SQL |
+
+---
+
+## Roadmap
+
+### Completed
+
+- [x] **Phase 1** — Core: GetTable, CRUD, raw SQL, transactions
+- [x] **Phase 2** — DBML Code Generator, WhereBuilder, convention mapping
+- [x] **Phase 3** — Attach/Detach, server-side queries, update tracking
+- [x] **Phase 4** — Full Async API, Find/FindAsync, AsNoTracking
+- [x] **Phase 5** — Database Schema CodeGen
+- [x] **Phase 6** — FK Navigation, Include API, Performance Tests
+
+### Planned
+
+- [ ] **Phase 7 — Extended LINQ**
+  - `Select(x => new { ... })` — Projection queries
+  - `OrderBy()` / `OrderByDescending()` / `ThenBy()`
+  - `Skip()` / `Take()` — Pagination
+  - `Distinct()`, `Max()`, `Min()`, `Sum()`, `Average()`
+- [ ] **Phase 8 — Bulk Operations**
+  - `InsertAllOnSubmit(IEnumerable<T>)` with `SqlBulkCopy` backend
+  - `BulkInsert<T>(IEnumerable<T>)` — Direct bulk insert (no tracking)
+  - `BulkUpdate<T>()`, `BulkDelete<T>()` — Batch DML
+- [ ] **Phase 9 — Collection Navigation**
+  - One-to-many navigation (`Order.OrderDetails`)
+  - `Include(x => x.Children)` for collections
+  - Nested `ThenInclude()` for multi-level loading
+- [ ] **Phase 10 — Transaction Helpers**
+  - `db.ExecuteInTransaction(action)` — Auto commit/rollback
+  - `db.ExecuteInTransactionAsync(func)` — Async variant
+  - `Savepoint` support for nested operations
+- [ ] **Phase 11 — ChangeTracker API**
+  - `db.ChangeTracker.Entries<T>()` — Query tracked entities
+  - `EntityState` enum: `Unchanged`, `Added`, `Modified`, `Deleted`
+  - `db.ChangeTracker.HasChanges()` — Quick check
+- [ ] **Phase 12 — Quality of Life**
+  - `InsertAndGetId<T>()` — Insert and return generated identity
+  - `Upsert<T>()` — Insert or update (MERGE)
+  - `ExecuteScalar<T>()` — Single value queries
+  - `Exists<T>(predicate)` — Alias for `Any()` with better SQL
+
+> **Note:** Phases are prioritized by real-world usage needs. Phase 7-8 are highest priority.
+> Migration and full IQueryable are explicitly **not planned** — use external tools for schema management and `ExecuteQuery<T>()` for complex SQL.
+
+---
+
 ## License
 
 MIT
@@ -452,14 +526,30 @@ await db.SubmitChangesAsync();
 - 🔍 **Server-side query** — `Where()` dịch LINQ → SQL WHERE
 - 🧲 **Find by PK** — `Find()` / `FindAsync()`
 - 🚀 **AsNoTracking** — Bỏ tracking cho query read-only
-- � **FK Navigation** — Auto-load FK entities, batch IN query
+- 🔗 **FK Navigation** — Auto-load FK entities, batch IN query
 - 🎯 **Include()** — Selective FK loading per-query
-- �📊 **Update tracking** — Tự phát hiện thay đổi entity
+- 📊 **Update tracking** — Tự phát hiện thay đổi entity
 - 🛠️ **Code Gen** — Gen code trực tiếp từ SQL Server hoặc `.dbml`
 - 🔌 **Đa DB** — SQL Server + SQLite
 - 🧪 **79 tests** — Unit, integration & performance
 
+## Hạn chế
+
+LiteSql được thiết kế là **thay thế nhẹ cho L2S**, không phải ORM đầy đủ như Entity Framework.
+
+| Nhóm | Feature | Mô tả |
+|---|---|---|
+| **Schema** | Migration | Không có migration. Schema quản lý bằng SQL scripts bên ngoài |
+| **Hiệu năng** | Bulk Insert | Không có `SqlBulkCopy`. Insert từng row |
+| **LINQ** | Full LINQ | Chỉ có `Where`, `FirstOrDefault`, `Any`, `Count`. Chưa có `Select`, `OrderBy`, `Skip/Take` |
+| **Transaction** | Helpers | Có cơ bản. Chưa có `ExecuteInTransaction()` |
+| **ORM** | Graph Object | Không insert/update cả cây object (parent + children) |
+| **ORM** | Collection Nav | FK navigation chỉ 1 chiều (many-to-one). Chưa có `Order.OrderDetails` |
+| **ORM** | ChangeTracker API | Có snapshot tracking, chưa có API query trạng thái entity |
+
 ## Lộ trình
+
+### Đã hoàn thành
 
 - [x] **Phase 1** — Core: GetTable, CRUD, raw SQL, transactions
 - [x] **Phase 2** — DBML Code Generator, WhereBuilder, convention mapping
@@ -467,3 +557,14 @@ await db.SubmitChangesAsync();
 - [x] **Phase 4** — Full Async API, Find/FindAsync, AsNoTracking
 - [x] **Phase 5** — Database Schema CodeGen
 - [x] **Phase 6** — FK Navigation, Include API, Performance Tests
+
+### Dự kiến
+
+- [ ] **Phase 7 — Mở rộng LINQ** — `Select()`, `OrderBy()`, `Skip()`/`Take()`, aggregate
+- [ ] **Phase 8 — Bulk Operations** — `SqlBulkCopy`, `BulkUpdate`, `BulkDelete`
+- [ ] **Phase 9 — Collection Navigation** — One-to-many, `ThenInclude()`
+- [ ] **Phase 10 — Transaction Helpers** — `ExecuteInTransaction()`, Savepoint
+- [ ] **Phase 11 — ChangeTracker API** — `Entries<T>()`, `EntityState`, `HasChanges()`
+- [ ] **Phase 12 — Tiện ích** — `InsertAndGetId()`, `Upsert()`, `ExecuteScalar()`
+
+> **Ghi chú:** Migration và Full IQueryable **không nằm trong kế hoạch** — dùng công cụ ngoài (DbUp, FluentMigrator) cho schema và `ExecuteQuery<T>()` cho SQL phức tạp.
