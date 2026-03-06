@@ -142,7 +142,7 @@ namespace LiteSql.CodeGen
                     var assoc = navAssocs[i];
                     var memberName = navMemberNames[i];
                     sb.AppendLine($"        // Nav: {assoc.OtherType}.{assoc.OtherKey} -> {assoc.ThisKey}");
-                    sb.AppendLine($"        [Association(Name = \"{assoc.Name}\", ThisKey = \"{assoc.ThisKey}\", OtherKey = \"{assoc.OtherKey}\")]");
+                    sb.AppendLine($"        // [Association(Name = \"{assoc.Name}\", ThisKey = \"{assoc.ThisKey}\", OtherKey = \"{assoc.OtherKey}\")]");
                     sb.AppendLine($"        // public EntitySet<{assoc.OtherType}> {memberName} {{ get; set; }}");
                     sb.AppendLine();
                 }
