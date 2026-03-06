@@ -113,7 +113,7 @@ namespace LiteSql.CodeGen
                 sb.AppendLine();
             }
 
-            // Associations (as comments/stubs for Phase 1)
+            // Associations
             var navAssocs = table.Associations.Where(a => !a.IsForeignKey).ToList();
             var fkAssocs = table.Associations.Where(a => a.IsForeignKey).ToList();
 
@@ -122,19 +122,28 @@ namespace LiteSql.CodeGen
                 sb.AppendLine("        #region Associations (navigation - not loaded by default)");
                 sb.AppendLine();
 
-                foreach (var assoc in fkAssocs)
+                // Fix duplicate FK member names: when multiple FKs reference the same type,
+                // disambiguate using the FK column name (e.g. idLeader → tbSYS_User_Leader)
+                var fkMemberNames = ResolveDuplicateNames(fkAssocs);
+                for (int i = 0; i < fkAssocs.Count; i++)
                 {
+                    var assoc = fkAssocs[i];
+                    var memberName = fkMemberNames[i];
                     sb.AppendLine($"        // FK: {assoc.ThisKey} -> {assoc.OtherType}.{assoc.OtherKey}");
                     sb.AppendLine($"        [Association(Name = \"{assoc.Name}\", ThisKey = \"{assoc.ThisKey}\", OtherKey = \"{assoc.OtherKey}\", IsForeignKey = true)]");
-                    sb.AppendLine($"        public {assoc.OtherType} {assoc.MemberName} {{ get; set; }}");
+                    sb.AppendLine($"        public {assoc.OtherType} {memberName} {{ get; set; }}");
                     sb.AppendLine();
                 }
 
-                foreach (var assoc in navAssocs)
+                // Fix duplicate nav member names similarly
+                var navMemberNames = ResolveDuplicateNames(navAssocs);
+                for (int i = 0; i < navAssocs.Count; i++)
                 {
+                    var assoc = navAssocs[i];
+                    var memberName = navMemberNames[i];
                     sb.AppendLine($"        // Nav: {assoc.OtherType}.{assoc.OtherKey} -> {assoc.ThisKey}");
                     sb.AppendLine($"        [Association(Name = \"{assoc.Name}\", ThisKey = \"{assoc.ThisKey}\", OtherKey = \"{assoc.OtherKey}\")]");
-                    sb.AppendLine($"        // public EntitySet<{assoc.OtherType}> {assoc.MemberName} {{ get; set; }}");
+                    sb.AppendLine($"        // public EntitySet<{assoc.OtherType}> {memberName} {{ get; set; }}");
                     sb.AppendLine();
                 }
 
@@ -142,6 +151,44 @@ namespace LiteSql.CodeGen
             }
 
             sb.AppendLine("    }");
+        }
+
+        /// <summary>
+        /// Resolves duplicate MemberNames in a list of associations.
+        /// If multiple associations have the same MemberName, appends a suffix
+        /// derived from their key column (e.g. "idLeader" → "_Leader").
+        /// </summary>
+        private static List<string> ResolveDuplicateNames(List<DbmlAssociation> assocs)
+        {
+            var names = assocs.Select(a => a.MemberName).ToList();
+
+            // Find duplicates
+            var counts = new Dictionary<string, int>();
+            foreach (var n in names)
+                counts[n] = counts.ContainsKey(n) ? counts[n] + 1 : 1;
+
+            var result = new List<string>();
+            for (int i = 0; i < assocs.Count; i++)
+            {
+                var assoc = assocs[i];
+                var baseName = assoc.MemberName;
+
+                if (counts[baseName] > 1)
+                {
+                    // Disambiguate: use the relevant key column with "id" prefix removed
+                    var keyCol = assoc.IsForeignKey ? assoc.ThisKey : assoc.OtherKey;
+                    var suffix = keyCol.StartsWith("id", StringComparison.OrdinalIgnoreCase)
+                        ? keyCol.Substring(2)
+                        : keyCol;
+                    result.Add($"{assoc.OtherType}_{suffix}");
+                }
+                else
+                {
+                    result.Add(baseName);
+                }
+            }
+
+            return result;
         }
 
         /// <summary>
