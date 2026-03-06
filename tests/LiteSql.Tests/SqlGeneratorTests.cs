@@ -12,7 +12,7 @@ namespace LiteSql.Tests
         {
             var mapping = MappingCache.GetMapping<Product>();
             var sql = SqlGenerator.GenerateSelectAll(mapping);
-            Assert.Equal("SELECT * FROM [dbo.Products]", sql);
+            Assert.Equal("SELECT * FROM [dbo].[Products]", sql);
         }
 
         [Fact]
@@ -23,7 +23,7 @@ namespace LiteSql.Tests
 
             var (sql, parameters) = SqlGenerator.GenerateInsert(mapping, product);
 
-            Assert.Contains("INSERT INTO [dbo.Products]", sql);
+            Assert.Contains("INSERT INTO [dbo].[Products]", sql);
             Assert.Contains("[ProductName]", sql);
             Assert.Contains("[UnitPrice]", sql);
             Assert.Contains("[CategoryId]", sql);
@@ -56,7 +56,7 @@ namespace LiteSql.Tests
 
             var (sql, parameters) = SqlGenerator.GenerateDelete(mapping, product);
 
-            Assert.Equal("DELETE FROM [dbo.Products] WHERE [ProductId] = @pk_ProductId", sql);
+            Assert.Equal("DELETE FROM [dbo].[Products] WHERE [ProductId] = @pk_ProductId", sql);
             Assert.Equal(42, parameters["@pk_ProductId"]);
         }
 
@@ -68,7 +68,7 @@ namespace LiteSql.Tests
 
             var (sql, parameters) = SqlGenerator.GenerateUpdate(mapping, product);
 
-            Assert.Contains("UPDATE [dbo.Products]", sql);
+            Assert.Contains("UPDATE [dbo].[Products]", sql);
             Assert.Contains("SET", sql);
             Assert.Contains("[ProductName] = @ProductName", sql);
             Assert.Contains("[UnitPrice] = @UnitPrice", sql);

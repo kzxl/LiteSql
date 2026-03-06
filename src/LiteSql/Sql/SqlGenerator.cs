@@ -19,7 +19,7 @@ namespace LiteSql.Sql
         /// </summary>
         public static string GenerateSelectAll(EntityMapping mapping)
         {
-            return $"SELECT * FROM [{mapping.TableName}]";
+            return $"SELECT * FROM {QuoteTableName(mapping.TableName)}";
         }
 
         /// <summary>
@@ -34,7 +34,7 @@ namespace LiteSql.Sql
             var columnNames = columns.Select(c => $"[{c.ColumnName}]");
             var paramNames = columns.Select(c => $"@{c.ColumnName}");
 
-            var sql = $"INSERT INTO [{mapping.TableName}] ({string.Join(", ", columnNames)}) " +
+            var sql = $"INSERT INTO {QuoteTableName(mapping.TableName)} ({string.Join(", ", columnNames)}) " +
                       $"VALUES ({string.Join(", ", paramNames)})";
 
             // Identity retrieval is handled separately by LiteContext.ExecuteInsert
@@ -55,7 +55,7 @@ namespace LiteSql.Sql
                     $"Cannot generate DELETE for '{mapping.EntityType.Name}': no primary key defined.");
 
             var whereClause = BuildWhereByPrimaryKeys(mapping, entity, out var parameters);
-            var sql = $"DELETE FROM [{mapping.TableName}] WHERE {whereClause}";
+            var sql = $"DELETE FROM {QuoteTableName(mapping.TableName)} WHERE {whereClause}";
             return (sql, parameters);
         }
 
@@ -79,7 +79,7 @@ namespace LiteSql.Sql
 
             var whereClause = BuildWhereByPrimaryKeys(mapping, entity, out var whereParams);
 
-            var sql = $"UPDATE [{mapping.TableName}] " +
+            var sql = $"UPDATE {QuoteTableName(mapping.TableName)} " +
                       $"SET {string.Join(", ", setClauses)} " +
                       $"WHERE {whereClause}";
 
@@ -143,5 +143,16 @@ namespace LiteSql.Sql
         }
 
         #endregion
+
+        /// <summary>
+        /// Quotes a table name for SQL. Handles schema.table format:
+        /// "dbo.Users" → "[dbo].[Users]", "Users" → "[Users]".
+        /// </summary>
+        internal static string QuoteTableName(string tableName)
+        {
+            if (string.IsNullOrEmpty(tableName)) return tableName;
+            var parts = tableName.Split('.');
+            return string.Join(".", parts.Select(p => $"[{p}]"));
+        }
     }
 }
