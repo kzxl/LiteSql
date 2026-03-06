@@ -1,0 +1,8 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/LiteSql/LiteSql.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/LiteSql.Tests/LiteSql.Tests.csproj" />
+  </Folder>
+</Solution>
