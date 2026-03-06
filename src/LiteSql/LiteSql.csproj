@@ -2,6 +2,12 @@
 
   <PropertyGroup>
     <TargetFramework>netstandard2.0</TargetFramework>
+    <PackageId>LiteSql</PackageId>
+    <Version>1.0.0</Version>
+    <Authors>kzxl</Authors>
+    <Description>Lightweight LINQ to SQL replacement for .NET Core, powered by Dapper. Drop-in compatible API with full async support.</Description>
+    <PackageTags>orm;dapper;linq-to-sql;migration;dotnet-core</PackageTags>
+    <GeneratePackageOnBuild>false</GeneratePackageOnBuild>
   </PropertyGroup>
 
   <ItemGroup>

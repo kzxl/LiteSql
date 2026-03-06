@@ -63,11 +63,13 @@ namespace LiteSql.CodeGen
                 Console.WriteLine($"  Context:  {model.ContextClassName}");
                 Console.WriteLine($"  Tables:   {model.Tables.Count}");
 
-                // Determine output path
+                // Determine output path — defaults to {input}.designer.cs
+                // This OVERWRITES the L2S-generated .designer.cs file to avoid conflicts
                 if (string.IsNullOrEmpty(outputPath))
                 {
                     var dir = Path.GetDirectoryName(inputPath) ?? ".";
-                    outputPath = Path.Combine(dir, $"{model.ContextClassName}.designer.cs");
+                    var baseName = Path.GetFileNameWithoutExtension(inputPath);
+                    outputPath = Path.Combine(dir, $"{baseName}.designer.cs");
                 }
 
                 // Generate code
