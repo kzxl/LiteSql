@@ -15,7 +15,9 @@
 
 ### Key Features
 
-- 🔄 **L2S-compatible API** — `GetTable<T>()`, `InsertOnSubmit()`, `DeleteOnSubmit()`, `SubmitChanges()`
+- � **FK Navigation** — Auto-load related entities via `[Association]` attributes
+- 🎯 **Include()** — Selective FK loading per-query, avoiding unnecessary queries
+- �🔄 **L2S-compatible API** — `GetTable<T>()`, `InsertOnSubmit()`, `DeleteOnSubmit()`, `SubmitChanges()`
 - ⚡ **Full Async API** — `SubmitChangesAsync()`, `WhereAsync()`, `FirstOrDefaultAsync()`, `FindAsync()`
 - 🔍 **Server-side filtering** — `Where(predicate)` translates LINQ expressions to SQL WHERE
 - 🧲 **Find by PK** — `Find()` / `FindAsync()` for efficient primary key lookups
@@ -25,7 +27,7 @@
 - 🔌 **Multi-database** — SQL Server and SQLite, extensible to others
 - 📦 **.NET Standard 2.0** — Works on both .NET Framework and .NET Core / .NET 5+
 - 🛠️ **Code Generator** — Generate entities from SQL Server database or `.dbml` files
-- 🧪 **67 tests** — Unit & integration tests with SQLite in-memory
+- 🧪 **79 tests** — Unit, integration & performance tests with SQLite in-memory
 
 ## Packages
 
@@ -164,6 +166,54 @@ db.Products.FirstOrDefault(p => p.Id == 1);
 // → SELECT TOP 1 * FROM [Products] WHERE [Id] = @w0
 ```
 
+## FK Navigation (Auto-Load)
+
+LiteSql automatically loads FK related entities via `[Association]` attributes.
+Uses **batch IN queries** to avoid N+1 — 10 entities with 2 FKs = only 3 queries total.
+
+```csharp
+using (var db = RAFInventoryDataContext.New())
+{
+    // Default: ALL FK navigation properties auto-loaded
+    var stockIn = db.tbINV_StockIns.FirstOrDefault(s => s.id == 3);
+    Console.WriteLine(stockIn.tbINV_Warehouse.Code);       // ✅ loaded
+    Console.WriteLine(stockIn.tbSYS_User_Leader.FullName); // ✅ loaded
+}
+```
+
+### Include() — Selective FK Loading
+
+For **better performance**, specify only the FKs you need:
+
+```csharp
+using (var db = RAFInventoryDataContext.New())
+{
+    // Only load Warehouse FK (1 extra query instead of N)
+    var stockIn = db.tbINV_StockIns
+        .Include(s => s.tbINV_Warehouse)
+        .FirstOrDefault(s => s.id == 3);
+    Console.WriteLine(stockIn.tbINV_Warehouse.Code);       // ✅ loaded
+    Console.WriteLine(stockIn.tbSYS_User_Leader?.FullName); // null (not included)
+
+    // Multiple Include
+    var items = db.tbINV_StockIns
+        .Include(s => s.tbINV_Warehouse)
+        .Include(s => s.tbSYS_User_Leader)
+        .Where(s => s.Status == true);
+}
+```
+
+### DataLoadOptions (L2S-compatible)
+
+```csharp
+var options = new DataLoadOptions();
+options.LoadWith<tbINV_StockIn>(s => s.tbINV_Warehouse);
+db.LoadOptions = options; // All queries on this context use these rules
+
+// Empty LoadOptions = disable auto-load (fastest for list queries)
+db.LoadOptions = new DataLoadOptions();
+```
+
 ## Read-Only Queries (AsNoTracking)
 
 ```csharp
@@ -290,9 +340,29 @@ dotnet tool update --global LiteSql.CodeGen --add-source path/to/LiteSql/nupkg
 |---|---|
 | Primary key lookup | `Find()` / `FindAsync()` |
 | Skip tracking | `AsNoTracking()` |
+| FK auto-load | Automatic via `[Association]` |
+| Selective FK | `Include(x => x.Nav)` |
+| DataLoadOptions | `LoadWith<T>()` |
 | Async queries | `WhereAsync()`, `FirstOrDefaultAsync()`, `CountAsync()`, `AnyAsync()`, `ToListAsync()` |
 | Async submit | `SubmitChangesAsync()` |
 | Async raw SQL | `ExecuteQueryAsync()`, `ExecuteCommandAsync()` |
+
+## Performance vs LINQ to SQL
+
+Benchmark: 100 orders × 2 FK relations (SQLite in-memory)
+
+| Mode | LiteSql Queries | L2S Queries (N+1) | Speedup |
+|---|---|---|---|
+| **Include(1 FK)** | **2** | 101 | **50x fewer** |
+| **Default (all FK)** | **3** | 201 | **67x fewer** |
+| **No FK** | **1** | 1 | Same |
+
+| Benchmark | Avg Time (10 runs) |
+|---|---|
+| Default auto-load (100 orders × 2 FK) | ~19ms |
+| Include selective (100 orders × 1 FK) | ~10ms |
+| No FK load (100 orders) | ~15ms |
+| Async Include (100 orders × 1 FK) | ~10ms |
 
 ## Migration Guide
 
@@ -318,7 +388,7 @@ Or use the Code Generator to regenerate from your database directly.
 
 ```bash
 dotnet build
-dotnet test   # 67 tests
+dotnet test   # 79 tests
 dotnet pack src/LiteSql/LiteSql.csproj -c Release -o ./nupkg
 dotnet pack src/LiteSql.CodeGen/LiteSql.CodeGen.csproj -c Release -o ./nupkg
 ```
@@ -382,10 +452,12 @@ await db.SubmitChangesAsync();
 - 🔍 **Server-side query** — `Where()` dịch LINQ → SQL WHERE
 - 🧲 **Find by PK** — `Find()` / `FindAsync()`
 - 🚀 **AsNoTracking** — Bỏ tracking cho query read-only
-- 📊 **Update tracking** — Tự phát hiện thay đổi entity
+- � **FK Navigation** — Auto-load FK entities, batch IN query
+- 🎯 **Include()** — Selective FK loading per-query
+- �📊 **Update tracking** — Tự phát hiện thay đổi entity
 - 🛠️ **Code Gen** — Gen code trực tiếp từ SQL Server hoặc `.dbml`
 - 🔌 **Đa DB** — SQL Server + SQLite
-- 🧪 **67 tests** — Unit & integration
+- 🧪 **79 tests** — Unit, integration & performance
 
 ## Lộ trình
 
@@ -393,4 +465,5 @@ await db.SubmitChangesAsync();
 - [x] **Phase 2** — DBML Code Generator, WhereBuilder, convention mapping
 - [x] **Phase 3** — Attach/Detach, server-side queries, update tracking
 - [x] **Phase 4** — Full Async API, Find/FindAsync, AsNoTracking
-- [x] **Phase 5** — Database Schema CodeGen (connect SQL Server trực tiếp)
+- [x] **Phase 5** — Database Schema CodeGen
+- [x] **Phase 6** — FK Navigation, Include API, Performance Tests
