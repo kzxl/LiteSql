@@ -24,122 +24,172 @@
 - 🎯 **Same mapping attributes** — `[Table]`, `[Column]` with identical signatures
 - 🔌 **Multi-database** — SQL Server and SQLite, extensible to others
 - 📦 **.NET Standard 2.0** — Works on both .NET Framework and .NET Core / .NET 5+
-- 🛠️ **DBML Code Generator** — Generate entity classes from existing `.dbml` files
+- 🛠️ **Code Generator** — Generate entities from SQL Server database or `.dbml` files
 - 🧪 **67 tests** — Unit & integration tests with SQLite in-memory
 
-## Quick Start
+## Packages
 
-### Basic Usage
+| Package | Type | Description |
+|---|---|---|
+| **LiteSql** | Library (.NET Standard 2.0) | Core ORM — add to your project |
+| **LiteSql.CodeGen** | dotnet global tool (.NET 8+) | Code generator — generate entity classes |
+
+---
+
+## Getting Started
+
+### 1. Install the Code Generator
+
+```bash
+# Install from local NuGet source
+dotnet tool install --global LiteSql.CodeGen --add-source path/to/LiteSql/nupkg
+```
+
+### 2. Generate Entity Classes
+
+**From SQL Server (recommended for .NET Core projects):**
+
+```bash
+litesql-codegen -c "Server=.;Database=RAFInventory;Trusted_Connection=true;TrustServerCertificate=true" -n RAF.Models -o Models/dbRAF.cs
+```
+
+**From existing DBML file (migration from L2S):**
+
+```bash
+litesql-codegen DataClasses1.dbml -n MyNamespace -o Models/DataClasses1.cs
+```
+
+**All options:**
+
+```
+litesql-codegen <input.dbml> [options]          # from DBML file
+litesql-codegen -c <connection-string> [options] # from SQL Server
+
+Options:
+  -o, --output <path>       Output .cs file path
+  -n, --namespace <ns>      Target namespace (default: Models)
+  -c, --connection <cs>     SQL Server connection string
+      --context <name>      Override context class name
+  -h, --help                Show help
+```
+
+### 3. Add LiteSql to Your Project
+
+```bash
+dotnet add package LiteSql --source path/to/LiteSql/nupkg
+```
+
+### 4. Configure at Startup
 
 ```csharp
-// Configure once at startup
+using LiteSql;
+using Microsoft.Data.SqlClient;
+
+// Set connection factory (once at app startup)
 LiteContext.ConnectionFactory = cs => new SqlConnection(cs);
 
-using (var db = new MyDataContext("your-connection-string"))
+// Set default connection string for generated context
+RAFInventoryDataContext.DefaultConnectionString = "Server=.;Database=RAFInventory;...";
+```
+
+### 5. Use It
+
+```csharp
+using (var db = RAFInventoryDataContext.New())
 {
-    // Server-side queries (LINQ → SQL WHERE)
-    var users = db.tbSYS_Users.Where(u => u.IsActive).ToList();
+    // Server-side query (LINQ → SQL WHERE)
+    var activeUsers = db.tbSYS_Users.Where(u => u.Status).ToList();
 
     // Find by primary key
     var user = db.tbSYS_Users.Find(userId);
 
     // Insert
-    db.tbSYS_Users.InsertOnSubmit(new tbSYS_User { Name = "Alice" });
+    var newUser = new tbSYS_User { Username = "alice", FullName = "Alice" };
+    db.tbSYS_Users.InsertOnSubmit(newUser);
 
-    // Modify loaded entity (auto-detected)
-    user.Email = "newemail@example.com";
+    // Modify loaded entity (auto-detected by update tracking)
+    user.Department = "Engineering";
 
-    // Commit all changes
+    // Delete
+    var old = db.tbSYS_Users.FirstOrDefault(u => u.Username == "bob");
+    if (old != null) db.tbSYS_Users.DeleteOnSubmit(old);
+
+    // Commit all changes in a single transaction
     db.SubmitChanges();
 }
 ```
 
-### Async API
+---
+
+## Async API
+
+All sync methods have async counterparts:
 
 ```csharp
-using (var db = new MyDataContext("connection-string"))
+using (var db = RAFInventoryDataContext.New())
 {
-    // All query methods have async counterparts
-    var users = await db.tbSYS_Users.WhereAsync(u => u.IsActive);
-    var user  = await db.tbSYS_Users.FirstOrDefaultAsync(u => u.Name == "Alice");
-    var count = await db.tbSYS_Users.CountAsync(u => u.Status);
-    var exists = await db.tbSYS_Users.AnyAsync(u => u.Email == email);
-    var all   = await db.tbSYS_Users.ToListAsync();
-    var found = await db.tbSYS_Users.FindAsync(userId);
+    var users  = await db.tbSYS_Users.WhereAsync(u => u.Status);
+    var user   = await db.tbSYS_Users.FirstOrDefaultAsync(u => u.Username == "admin");
+    var count  = await db.tbSYS_Users.CountAsync(u => u.Status);
+    var exists = await db.tbSYS_Users.AnyAsync(u => u.Username == "admin");
+    var all    = await db.tbSYS_Users.ToListAsync();
+    var found  = await db.tbSYS_Users.FindAsync(userId);
 
     // Async submit
     db.tbSYS_Users.InsertOnSubmit(newUser);
     await db.SubmitChangesAsync();
 
     // Async raw SQL
-    var results = await db.ExecuteQueryAsync<Product>("SELECT * FROM Products WHERE Price > {0}", 100);
-    var affected = await db.ExecuteCommandAsync("UPDATE Products SET Price = {0} WHERE Id = {1}", price, id);
+    var results  = await db.ExecuteQueryAsync<tbSYS_User>("SELECT * FROM tbSYS_User WHERE Status = {0}", true);
+    var affected = await db.ExecuteCommandAsync("UPDATE tbSYS_User SET Status = {0} WHERE id = {1}", false, id);
 }
 ```
 
-### Read-Only Queries (AsNoTracking)
+## Server-Side Filtering
+
+LINQ expressions are translated to SQL, not filtered in memory:
 
 ```csharp
-// Skip change tracking for better performance on read-only queries
-var items = db.GetTable<Product>().AsNoTracking()
-    .Where(p => p.IsActive)
-    .ToList();
-// Modifications to these entities will NOT be saved on SubmitChanges
-```
-
-### Server-Side Filtering
-
-```csharp
-// These expressions are translated to SQL (not in-memory):
 db.Products.Where(p => p.Price > 100 && p.IsActive);
 // → SELECT * FROM [Products] WHERE [Price] > @w0 AND [IsActive] = @w1
 
 db.Products.Where(p => p.Name.Contains("Widget"));
-// → SELECT * FROM [Products] WHERE [Name] LIKE @w0  ('%Widget%')
+// → SELECT * FROM [Products] WHERE [Name] LIKE '%Widget%'
 
 var ids = new List<int> { 1, 2, 3 };
 db.Products.Where(p => ids.Contains(p.CategoryId));
 // → SELECT * FROM [Products] WHERE [CategoryId] IN (@w0, @w1, @w2)
 
 db.Products.FirstOrDefault(p => p.Id == 1);
-// → SELECT TOP 1 * FROM [Products] WHERE [Id] = @w0  (LIMIT 1 for SQLite)
+// → SELECT TOP 1 * FROM [Products] WHERE [Id] = @w0
 ```
 
-### Entity Mapping
-
-Use the **same attributes** as LINQ to SQL — just change `using`:
+## Read-Only Queries (AsNoTracking)
 
 ```csharp
-using LiteSql.Mapping;
+// Skip change tracking for better performance
+var items = db.GetTable<Product>().AsNoTracking()
+    .Where(p => p.IsActive).ToList();
+// Modifications to these entities will NOT be saved on SubmitChanges
+```
 
-[Table(Name = "dbo.Products")]
-public class Product
+## Raw SQL (L2S-style positional parameters)
+
+```csharp
+using (var db = new LiteContext(connection))
 {
-    [Column(Name = "ProductId", IsPrimaryKey = true, IsDbGenerated = true)]
-    public int Id { get; set; }
+    // {0}, {1} parameters — just like L2S
+    var results = db.ExecuteQuery<Product>(
+        "SELECT * FROM Products WHERE CategoryId = {0} AND Price > {1}",
+        categoryId, minPrice);
 
-    [Column(Name = "ProductName")]
-    public string Name { get; set; }
-
-    [Column(Name = "UnitPrice", CanBeNull = true)]
-    public decimal? Price { get; set; }
+    int affected = db.ExecuteCommand(
+        "UPDATE Products SET Price = {0} WHERE Id = {1}",
+        newPrice, productId);
 }
 ```
 
-### DBML Code Generator
-
-Generate LiteSql-compatible C# from existing `.dbml` files:
-
-```bash
-dotnet run --project src/LiteSql.CodeGen -- dbRAF.dbml -o Models/dbRAF.cs -n RAF.Models
-```
-
-The tool generates:
-- Entity classes with `[Table]`/`[Column]` attributes
-- Typed `Table<T>` properties (`db.tbSYS_Users`, `db.tbINV_StockIns`, etc.)
-- A `LiteContext` subclass matching your existing DataContext
-
-### Transaction Support
+## Transaction Support
 
 ```csharp
 using (var db = new LiteContext(connection))
@@ -150,12 +200,72 @@ using (var db = new LiteContext(connection))
     {
         db.GetTable<Order>().InsertOnSubmit(order);
         db.GetTable<OrderDetail>().InsertAllOnSubmit(details);
-        db.SubmitChanges();
+        db.SubmitChanges(); // Uses existing transaction
         db.Transaction.Commit();
     }
     catch { db.Transaction.Rollback(); throw; }
 }
 ```
+
+## SQL Logging
+
+```csharp
+db.Log = Console.Out; // Log all generated SQL to console
+```
+
+---
+
+## Code Generator Details
+
+### Generated Output
+
+The code generator creates:
+
+1. **DataContext class** — inherits `LiteContext`, with typed `Table<T>` properties
+2. **Entity classes** — `[Table]`/`[Column]` attributes, matching your DB schema
+3. **FK associations** — navigation property stubs with `[Association]` attributes
+
+### Example Generated Code
+
+```csharp
+public partial class RAFInventoryDataContext : LiteContext
+{
+    public RAFInventoryDataContext(IDbConnection connection) : base(connection) { }
+    public RAFInventoryDataContext(string connectionString) : base(connectionString) { }
+
+    public static RAFInventoryDataContext New() => new(DefaultConnectionString);
+    public static string DefaultConnectionString { get; set; }
+
+    public Table<tbSYS_User> tbSYS_Users => GetTable<tbSYS_User>();
+    public Table<tbINV_StockIn> tbINV_StockIns => GetTable<tbINV_StockIn>();
+}
+
+[Table(Name = "dbo.tbSYS_User")]
+public partial class tbSYS_User
+{
+    [Column(Name = "id", DbType = "BIGINT NOT NULL IDENTITY", IsPrimaryKey = true, IsDbGenerated = true)]
+    public long id { get; set; }
+
+    [Column(Name = "Username", DbType = "NVARCHAR(100) NOT NULL")]
+    public string Username { get; set; }
+}
+```
+
+### Updating Generated Code
+
+When your database schema changes, re-run the same command to regenerate:
+
+```bash
+litesql-codegen -c "Server=.;Database=RAFInventory;..." -n RAF.Models -o Models/dbRAF.cs
+```
+
+### Update the Tool
+
+```bash
+dotnet tool update --global LiteSql.CodeGen --add-source path/to/LiteSql/nupkg
+```
+
+---
 
 ## API Compatibility
 
@@ -165,26 +275,24 @@ using (var db = new LiteContext(connection))
 | `db.GetTable<T>()` | ✅ Same | Cached per type |
 | `table.InsertOnSubmit(e)` | ✅ Same | |
 | `table.DeleteOnSubmit(e)` | ✅ Same | |
+| `table.Attach(e)` | ✅ Same | 3 overloads |
 | `db.SubmitChanges()` | ✅ Same | Auto transaction |
 | `db.ExecuteQuery<T>(sql, ...)` | ✅ Same | `{0}` → `@p0` |
 | `db.ExecuteCommand(sql, ...)` | ✅ Same | `{0}` → `@p0` |
 | `db.Connection` / `Transaction` | ✅ Same | |
 | `[Table]`, `[Column]` | ✅ Same | Change `using` only |
 | `.Where()`, `.FirstOrDefault()` | ✅ Server-side SQL | Via WhereBuilder |
-| `table.Attach(e)` | ✅ Same | 3 overloads |
-| Update tracking | ✅ Snapshot-based | Auto-detect on `SubmitChanges` |
+| Update tracking | ✅ Snapshot-based | Auto-detect |
 
 ### Beyond L2S (EF Core-inspired)
 
-| Feature | Description |
+| Feature | Method |
 |---|---|
-| `FindAsync()` / `Find()` | Primary key lookup |
-| `AsNoTracking()` | Skip change tracking for reads |
-| `WhereAsync()` | Async server-side filtering |
-| `FirstOrDefaultAsync()` | Async with TOP/LIMIT |
-| `CountAsync()` / `AnyAsync()` | Async aggregate queries |
-| `ToListAsync()` | Async load all |
-| `SubmitChangesAsync()` | Async CRUD submission |
+| Primary key lookup | `Find()` / `FindAsync()` |
+| Skip tracking | `AsNoTracking()` |
+| Async queries | `WhereAsync()`, `FirstOrDefaultAsync()`, `CountAsync()`, `AnyAsync()`, `ToListAsync()` |
+| Async submit | `SubmitChangesAsync()` |
+| Async raw SQL | `ExecuteQueryAsync()`, `ExecuteCommandAsync()` |
 
 ## Migration Guide
 
@@ -204,11 +312,15 @@ using (var db = new LiteContext(connection))
    + public class MyDb : LiteContext
    ```
 
+Or use the Code Generator to regenerate from your database directly.
+
 ## Building
 
 ```bash
 dotnet build
 dotnet test   # 67 tests
+dotnet pack src/LiteSql/LiteSql.csproj -c Release -o ./nupkg
+dotnet pack src/LiteSql.CodeGen/LiteSql.CodeGen.csproj -c Release -o ./nupkg
 ```
 
 ## License
@@ -225,29 +337,60 @@ MIT
 
 **LINQ to SQL** chỉ hỗ trợ .NET Framework. **LiteSql** cung cấp API tương thích, bên dưới sử dụng Dapper — giúp code L2S chạy trên .NET Core với thay đổi tối thiểu.
 
-### Tính năng
+## Cách dùng
+
+### Bước 1: Cài Code Generator
+
+```bash
+dotnet tool install --global LiteSql.CodeGen --add-source path/to/LiteSql/nupkg
+```
+
+### Bước 2: Gen code từ SQL Server
+
+```bash
+litesql-codegen -c "Server=.;Database=MyDb;Trusted_Connection=true;TrustServerCertificate=true" -n MyApp.Models -o Models/MyDb.cs
+```
+
+### Bước 3: Add LiteSql vào project
+
+```bash
+dotnet add package LiteSql --source path/to/LiteSql/nupkg
+```
+
+### Bước 4: Cấu hình startup
+
+```csharp
+LiteContext.ConnectionFactory = cs => new SqlConnection(cs);
+MyDbDataContext.DefaultConnectionString = "Server=.;Database=MyDb;...";
+```
+
+### Bước 5: Dùng
+
+```csharp
+using var db = MyDbDataContext.New();
+var users = await db.tbSYS_Users.WhereAsync(u => u.Status);
+var user  = await db.tbSYS_Users.FindAsync(1);
+
+db.tbSYS_Users.InsertOnSubmit(new tbSYS_User { Username = "test" });
+await db.SubmitChangesAsync();
+```
+
+## Tính năng
 
 - 🔄 **API giống L2S** — `GetTable<T>()`, `InsertOnSubmit()`, `SubmitChanges()`
 - ⚡ **Full Async** — `SubmitChangesAsync()`, `WhereAsync()`, `FindAsync()`
-- 🔍 **Server-side** — `Where()` dịch LINQ → SQL WHERE
+- 🔍 **Server-side query** — `Where()` dịch LINQ → SQL WHERE
 - 🧲 **Find by PK** — `Find()` / `FindAsync()`
 - 🚀 **AsNoTracking** — Bỏ tracking cho query read-only
 - 📊 **Update tracking** — Tự phát hiện thay đổi entity
-- 🛠️ **DBML Code Gen** — Sinh code từ `.dbml` sẵn có
+- 🛠️ **Code Gen** — Gen code trực tiếp từ SQL Server hoặc `.dbml`
 - 🔌 **Đa DB** — SQL Server + SQLite
 - 🧪 **67 tests** — Unit & integration
-
-## Hướng dẫn migrate
-
-1. **Thay NuGet**: `System.Data.Linq` → `LiteSql`
-2. **Đổi `using`**: `System.Data.Linq` → `LiteSql`, `System.Data.Linq.Mapping` → `LiteSql.Mapping`
-3. **Đổi base class**: `DataContext` → `LiteContext`
-
-Code hiện tại — `GetTable<T>()`, `InsertOnSubmit()`, `SubmitChanges()`, raw SQL — **giữ nguyên**.
 
 ## Lộ trình
 
 - [x] **Phase 1** — Core: GetTable, CRUD, raw SQL, transactions
-- [x] **Phase 2** — DBML Code Generator, WhereBuilder, Update Tracking
-- [x] **Phase 3** — Attach/Detach, Server-side FirstOrDefault/Count/Any
+- [x] **Phase 2** — DBML Code Generator, WhereBuilder, convention mapping
+- [x] **Phase 3** — Attach/Detach, server-side queries, update tracking
 - [x] **Phase 4** — Full Async API, Find/FindAsync, AsNoTracking
+- [x] **Phase 5** — Database Schema CodeGen (connect SQL Server trực tiếp)
