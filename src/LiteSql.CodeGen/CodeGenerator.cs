@@ -56,6 +56,14 @@ namespace LiteSql.CodeGen
             sb.AppendLine($"    public partial class {model.ContextClassName} : LiteContext");
             sb.AppendLine("    {");
 
+            // Static constructor — auto-register SqlConnection factory
+            sb.AppendLine($"        static {model.ContextClassName}()");
+            sb.AppendLine("        {");
+            sb.AppendLine("            if (ConnectionFactory == null)");
+            sb.AppendLine("                ConnectionFactory = cs => new Microsoft.Data.SqlClient.SqlConnection(cs);");
+            sb.AppendLine("        }");
+            sb.AppendLine();
+
             // Constructors
             sb.AppendLine($"        public {model.ContextClassName}(IDbConnection connection) : base(connection) {{ }}");
             sb.AppendLine($"        public {model.ContextClassName}(string connectionString) : base(connectionString) {{ }}");
@@ -63,8 +71,7 @@ namespace LiteSql.CodeGen
 
             // Static factory method (common L2S pattern)
             sb.AppendLine($"        /// <summary>");
-            sb.AppendLine($"        /// Creates a new instance using ConnectionFactory.");
-            sb.AppendLine($"        /// Set LiteContext.ConnectionFactory at app startup.");
+            sb.AppendLine($"        /// Creates a new instance using DefaultConnectionString.");
             sb.AppendLine($"        /// </summary>");
             sb.AppendLine($"        public static {model.ContextClassName} New()");
             sb.AppendLine("        {");
