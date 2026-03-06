@@ -103,6 +103,22 @@ namespace LiteSql
 
         #endregion
 
+        #region Include (selective FK loading)
+
+        /// <summary>
+        /// Starts a selective FK loading query.
+        /// Only the specified navigation properties will be loaded (not all FKs).
+        /// Chain multiple Include() calls for multiple FKs.
+        /// Example: db.Orders.Include(o => o.Customer).Include(o => o.Product).Where(...)
+        /// </summary>
+        public IncludeQuery<T> Include(Expression<Func<T, object>> expression)
+        {
+            var query = new IncludeQuery<T>(this, _context, _changeTracker);
+            return query.Include(expression);
+        }
+
+        #endregion
+
         #region Sync Query Methods
 
         /// <summary>
