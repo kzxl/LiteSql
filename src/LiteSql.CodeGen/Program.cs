@@ -63,13 +63,14 @@ namespace LiteSql.CodeGen
                 Console.WriteLine($"  Context:  {model.ContextClassName}");
                 Console.WriteLine($"  Tables:   {model.Tables.Count}");
 
-                // Determine output path — defaults to {input}.designer.cs
-                // This OVERWRITES the L2S-generated .designer.cs file to avoid conflicts
+                // Determine output path — defaults to {input}.LiteSql.cs
+                // Uses separate filename to avoid overwriting L2S .designer.cs
+                // User can use -o to specify exact output path if needed
                 if (string.IsNullOrEmpty(outputPath))
                 {
                     var dir = Path.GetDirectoryName(inputPath) ?? ".";
                     var baseName = Path.GetFileNameWithoutExtension(inputPath);
-                    outputPath = Path.Combine(dir, $"{baseName}.designer.cs");
+                    outputPath = Path.Combine(dir, $"{baseName}.LiteSql.cs");
                 }
 
                 // Generate code
@@ -84,6 +85,23 @@ namespace LiteSql.CodeGen
                 Console.WriteLine($"  Output:   {outputPath}");
                 Console.WriteLine();
                 Console.WriteLine($"Generated {model.Tables.Count} entity classes + 1 DataContext.");
+                Console.WriteLine();
+
+                // Check if L2S .designer.cs file exists
+                var dir2 = Path.GetDirectoryName(inputPath) ?? ".";
+                var baseName2 = Path.GetFileNameWithoutExtension(inputPath);
+                var designerFile = Path.Combine(dir2, $"{baseName2}.designer.cs");
+                if (File.Exists(designerFile) && outputPath != designerFile)
+                {
+                    Console.WriteLine("NOTE: L2S designer file detected:");
+                    Console.WriteLine($"  {designerFile}");
+                    Console.WriteLine();
+                    Console.WriteLine("To avoid class conflicts, either:");
+                    Console.WriteLine("  1. Exclude the .designer.cs from your project build");
+                    Console.WriteLine("  2. Delete the .designer.cs + .dbml (full migration)");
+                    Console.WriteLine("  3. Re-run with -o to overwrite: -o \"" + designerFile + "\"");
+                }
+
                 Console.WriteLine("Done!");
                 return 0;
             }
@@ -102,13 +120,14 @@ namespace LiteSql.CodeGen
             Console.WriteLine("  litesql-codegen <input.dbml> [options]");
             Console.WriteLine();
             Console.WriteLine("Options:");
-            Console.WriteLine("  -o, --output <path>       Output .cs file path (default: {ContextClass}.designer.cs)");
+            Console.WriteLine("  -o, --output <path>       Output .cs file path (default: {input}.LiteSql.cs)");
             Console.WriteLine("  -n, --namespace <ns>      Target namespace (default: Models)");
             Console.WriteLine("  -h, --help                Show this help");
             Console.WriteLine();
             Console.WriteLine("Examples:");
             Console.WriteLine("  litesql-codegen dbRAF.dbml");
             Console.WriteLine("  litesql-codegen dbRAF.dbml -o Models/dbRAF.cs -n RAF.Models");
+            Console.WriteLine("  litesql-codegen Data.dbml -o Data.designer.cs   (overwrite L2S file)");
         }
     }
 }
