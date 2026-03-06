@@ -63,6 +63,12 @@ namespace LiteSql
         public TextWriter Log { get; set; }
         public bool ObjectTrackingEnabled { get; set; } = true;
 
+        /// <summary>
+        /// Specifies which navigation properties to eagerly load when querying.
+        /// Compatible with System.Data.Linq.DataLoadOptions.
+        /// </summary>
+        public DataLoadOptions LoadOptions { get; set; }
+
         #endregion
 
         #region Core Sync Methods

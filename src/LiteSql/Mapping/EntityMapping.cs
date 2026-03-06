@@ -20,8 +20,29 @@ namespace LiteSql.Mapping
     }
 
     /// <summary>
+    /// Represents a FK association mapping.
+    /// </summary>
+    public class AssociationMapping
+    {
+        /// <summary>Navigation property on the entity (e.g. tbSYS_User_Leader)</summary>
+        public PropertyInfo Property { get; set; }
+
+        /// <summary>FK column name on this entity (e.g. idLeader)</summary>
+        public string ThisKey { get; set; }
+
+        /// <summary>PK column name on the related entity (e.g. id)</summary>
+        public string OtherKey { get; set; }
+
+        /// <summary>True if this side holds the FK</summary>
+        public bool IsForeignKey { get; set; }
+
+        /// <summary>CLR type of the related entity</summary>
+        public Type OtherType { get; set; }
+    }
+
+    /// <summary>
     /// Represents the mapping metadata for an entity type,
-    /// including table name and all column mappings.
+    /// including table name, column mappings, and FK associations.
     /// </summary>
     public class EntityMapping
     {
@@ -31,6 +52,7 @@ namespace LiteSql.Mapping
         public IReadOnlyList<ColumnMapping> PrimaryKeys { get; set; }
         public IReadOnlyList<ColumnMapping> InsertableColumns { get; set; }
         public IReadOnlyList<ColumnMapping> UpdatableColumns { get; set; }
+        public IReadOnlyList<AssociationMapping> Associations { get; set; }
     }
 
     /// <summary>
@@ -119,6 +141,24 @@ namespace LiteSql.Mapping
             var insertable = allColumns.Where(c => !c.IsDbGenerated).ToList();
             var updatable = allColumns.Where(c => !c.IsPrimaryKey && !c.IsDbGenerated).ToList();
 
+            // Build association mappings from [Association] attributes
+            var associations = new List<AssociationMapping>();
+            foreach (var prop in type.GetProperties(BindingFlags.Public | BindingFlags.Instance))
+            {
+                var assocAttr = prop.GetCustomAttribute<AssociationAttribute>();
+                if (assocAttr != null && assocAttr.IsForeignKey)
+                {
+                    associations.Add(new AssociationMapping
+                    {
+                        Property = prop,
+                        ThisKey = assocAttr.ThisKey,
+                        OtherKey = assocAttr.OtherKey,
+                        IsForeignKey = true,
+                        OtherType = prop.PropertyType
+                    });
+                }
+            }
+
             return new EntityMapping
             {
                 EntityType = type,
@@ -126,7 +166,8 @@ namespace LiteSql.Mapping
                 Columns = allColumns,
                 PrimaryKeys = primaryKeys,
                 InsertableColumns = insertable,
-                UpdatableColumns = updatable
+                UpdatableColumns = updatable,
+                Associations = associations
             };
         }
 

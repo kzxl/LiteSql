@@ -239,7 +239,11 @@ namespace LiteSql
             _context.EnsureConnectionOpen();
             var entity = _context.Connection.QueryFirstOrDefault<T>(sql, dp,
                 transaction: _context.Transaction, commandTimeout: _context.CommandTimeout);
-            if (entity != null) TrackSingle(entity, mapping);
+            if (entity != null)
+            {
+                TrackSingle(entity, mapping);
+                LoadAssociations(new List<T> { entity }, mapping);
+            }
             return entity;
         }
 
@@ -253,7 +257,11 @@ namespace LiteSql
             await _context.EnsureConnectionOpenAsync().ConfigureAwait(false);
             var entity = await _context.Connection.QueryFirstOrDefaultAsync<T>(sql, dp,
                 transaction: _context.Transaction, commandTimeout: _context.CommandTimeout).ConfigureAwait(false);
-            if (entity != null) TrackSingle(entity, mapping);
+            if (entity != null)
+            {
+                TrackSingle(entity, mapping);
+                await LoadAssociationsAsync(new List<T> { entity }, mapping).ConfigureAwait(false);
+            }
             return entity;
         }
 
@@ -291,6 +299,7 @@ namespace LiteSql
             var results = _context.Connection.Query<T>(fullSql, dp,
                 transaction: _context.Transaction, commandTimeout: _context.CommandTimeout).ToList();
             TrackResults(results, mapping);
+            LoadAssociations(results, mapping);
             return results;
         }
 
@@ -304,6 +313,7 @@ namespace LiteSql
                 new CommandDefinition(fullSql, dp, transaction: _context.Transaction,
                     commandTimeout: _context.CommandTimeout, cancellationToken: ct)).ConfigureAwait(false)).ToList();
             TrackResults(results, mapping);
+            await LoadAssociationsAsync(results, mapping, ct).ConfigureAwait(false);
             return results;
         }
 
@@ -336,6 +346,7 @@ namespace LiteSql
             var mapping = MappingCache.GetMapping<T>();
             var results = _context.ExecuteQuery<T>(SqlGenerator.GenerateSelectAll(mapping)).ToList();
             TrackResults(results, mapping);
+            LoadAssociations(results, mapping);
             return results;
         }
 
@@ -358,6 +369,193 @@ namespace LiteSql
             if (parameters != null)
                 foreach (var kv in parameters) dp.Add(kv.Key, kv.Value);
             return dp;
+        }
+
+        /// <summary>
+        /// Batch-loads FK navigation properties for a list of entities.
+        /// If LoadOptions is set, only loads registered properties.
+        /// If LoadOptions is null, loads ALL FK associations automatically.
+        /// Uses IN queries to avoid N+1 problem.
+        /// </summary>
+        private void LoadAssociations(List<T> entities, EntityMapping mapping)
+        {
+            if (entities == null || entities.Count == 0) return;
+            if (mapping.Associations == null || mapping.Associations.Count == 0) return;
+
+            IEnumerable<AssociationMapping> assocsToLoad;
+
+            if (_context.LoadOptions != null)
+            {
+                // Selective mode: only load registered properties
+                var loadRules = _context.LoadOptions.GetLoadRules(typeof(T));
+                if (loadRules.Count == 0) return;
+                assocsToLoad = mapping.Associations
+                    .Where(a => a.IsForeignKey && loadRules.Any(r => r.Name == a.Property.Name));
+            }
+            else
+            {
+                // Auto mode: load ALL FK associations
+                assocsToLoad = mapping.Associations.Where(a => a.IsForeignKey);
+            }
+
+            foreach (var assoc in assocsToLoad)
+            {
+                LoadFkAssociation(entities, assoc);
+            }
+        }
+
+        /// <summary>
+        /// Loads a single FK association for all entities using a batch IN query.
+        /// </summary>
+        private void LoadFkAssociation(List<T> entities, AssociationMapping assoc)
+        {
+            // Get the FK column property (e.g. idLeader)
+            var fkProp = typeof(T).GetProperty(assoc.ThisKey);
+            if (fkProp == null) return;
+
+            // Collect all non-null FK values
+            var fkValues = entities
+                .Select(e => fkProp.GetValue(e))
+                .Where(v => v != null && !v.Equals(GetDefault(fkProp.PropertyType)))
+                .Distinct()
+                .ToList();
+
+            if (fkValues.Count == 0) return;
+
+            // Get related entity mapping
+            var relatedMapping = MappingCache.GetMapping(assoc.OtherType);
+            var quotedTable = SqlGenerator.QuoteTableName(relatedMapping.TableName);
+
+            // Build batch IN query: SELECT * FROM [dbo].[tbSYS_User] WHERE [id] IN (@p0, @p1, ...)
+            var dp = new DynamicParameters();
+            var paramNames = new List<string>();
+            for (int i = 0; i < fkValues.Count; i++)
+            {
+                var pName = $"@fk{i}";
+                paramNames.Add(pName);
+                dp.Add(pName, fkValues[i]);
+            }
+
+            var sql = $"SELECT * FROM {quotedTable} WHERE [{assoc.OtherKey}] IN ({string.Join(", ", paramNames)})";
+
+            _context.EnsureConnectionOpen();
+            // Query as dynamic, then use Dapper to map
+            var relatedEntities = _context.Connection.Query(
+                assoc.OtherType, sql, dp,
+                transaction: _context.Transaction,
+                commandTimeout: _context.CommandTimeout).ToList();
+
+            // Build lookup: OtherKey value → related entity
+            var otherKeyProp = assoc.OtherType.GetProperty(assoc.OtherKey);
+            if (otherKeyProp == null) return;
+
+            var lookup = new Dictionary<object, object>();
+            foreach (var related in relatedEntities)
+            {
+                var keyVal = otherKeyProp.GetValue(related);
+                if (keyVal != null) lookup[keyVal] = related;
+            }
+
+            // Set navigation property on each entity
+            foreach (var entity in entities)
+            {
+                var fkVal = fkProp.GetValue(entity);
+                if (fkVal != null && lookup.TryGetValue(fkVal, out var relatedEntity))
+                {
+                    assoc.Property.SetValue(entity, relatedEntity);
+                }
+            }
+        }
+
+        /// <summary>
+        /// Async version of LoadAssociations.
+        /// </summary>
+        private async Task LoadAssociationsAsync(List<T> entities, EntityMapping mapping,
+            CancellationToken ct = default)
+        {
+            if (entities == null || entities.Count == 0) return;
+            if (mapping.Associations == null || mapping.Associations.Count == 0) return;
+
+            IEnumerable<AssociationMapping> assocsToLoad;
+
+            if (_context.LoadOptions != null)
+            {
+                var loadRules = _context.LoadOptions.GetLoadRules(typeof(T));
+                if (loadRules.Count == 0) return;
+                assocsToLoad = mapping.Associations
+                    .Where(a => a.IsForeignKey && loadRules.Any(r => r.Name == a.Property.Name));
+            }
+            else
+            {
+                assocsToLoad = mapping.Associations.Where(a => a.IsForeignKey);
+            }
+
+            foreach (var assoc in assocsToLoad)
+            {
+                await LoadFkAssociationAsync(entities, assoc, ct).ConfigureAwait(false);
+            }
+        }
+
+        /// <summary>
+        /// Async batch FK loading.
+        /// </summary>
+        private async Task LoadFkAssociationAsync(List<T> entities, AssociationMapping assoc,
+            CancellationToken ct = default)
+        {
+            var fkProp = typeof(T).GetProperty(assoc.ThisKey);
+            if (fkProp == null) return;
+
+            var fkValues = entities
+                .Select(e => fkProp.GetValue(e))
+                .Where(v => v != null && !v.Equals(GetDefault(fkProp.PropertyType)))
+                .Distinct()
+                .ToList();
+
+            if (fkValues.Count == 0) return;
+
+            var relatedMapping = MappingCache.GetMapping(assoc.OtherType);
+            var quotedTable = SqlGenerator.QuoteTableName(relatedMapping.TableName);
+
+            var dp = new DynamicParameters();
+            var paramNames = new List<string>();
+            for (int i = 0; i < fkValues.Count; i++)
+            {
+                var pName = $"@fk{i}";
+                paramNames.Add(pName);
+                dp.Add(pName, fkValues[i]);
+            }
+
+            var sql = $"SELECT * FROM {quotedTable} WHERE [{assoc.OtherKey}] IN ({string.Join(", ", paramNames)})";
+
+            await _context.EnsureConnectionOpenAsync(ct).ConfigureAwait(false);
+            var relatedEntities = (await _context.Connection.QueryAsync(
+                assoc.OtherType, sql, dp,
+                transaction: _context.Transaction,
+                commandTimeout: _context.CommandTimeout).ConfigureAwait(false)).ToList();
+
+            var otherKeyProp = assoc.OtherType.GetProperty(assoc.OtherKey);
+            if (otherKeyProp == null) return;
+
+            var lookup = new Dictionary<object, object>();
+            foreach (var related in relatedEntities)
+            {
+                var keyVal = otherKeyProp.GetValue(related);
+                if (keyVal != null) lookup[keyVal] = related;
+            }
+
+            foreach (var entity in entities)
+            {
+                var fkVal = fkProp.GetValue(entity);
+                if (fkVal != null && lookup.TryGetValue(fkVal, out var relatedEntity))
+                {
+                    assoc.Property.SetValue(entity, relatedEntity);
+                }
+            }
+        }
+
+        private static object GetDefault(Type type)
+        {
+            return type.IsValueType ? Activator.CreateInstance(type) : null;
         }
 
         #endregion
