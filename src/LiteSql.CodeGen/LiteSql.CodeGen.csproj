@@ -5,6 +5,15 @@
     <TargetFramework>net10.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
+
+    <!-- Dotnet Tool packaging -->
+    <PackAsTool>true</PackAsTool>
+    <ToolCommandName>litesql-codegen</ToolCommandName>
+    <PackageId>LiteSql.CodeGen</PackageId>
+    <Version>1.0.0</Version>
+    <Authors>kzxl</Authors>
+    <Description>Code generator for LiteSql - generates entity classes from DBML files or SQL Server databases.</Description>
+    <PackageTags>litesql;codegen;orm;dapper;dbml</PackageTags>
   </PropertyGroup>
 
   <ItemGroup>
