@@ -1,5 +1,7 @@
+using Dapper;
 using LiteSql.ChangeTracking;
 using LiteSql.Mapping;
+using LiteSql.Sql;
 using System;
 using System.Collections;
 using System.Collections.Generic;
@@ -24,6 +26,8 @@ namespace LiteSql
             _context = context ?? throw new ArgumentNullException(nameof(context));
             _changeTracker = changeTracker ?? throw new ArgumentNullException(nameof(changeTracker));
         }
+
+        #region Insert / Delete
 
         /// <summary>
         /// Marks an entity for insertion on next SubmitChanges().
@@ -71,14 +75,50 @@ namespace LiteSql
             }
         }
 
+        #endregion
+
+        #region Querying
+
+        /// <summary>
+        /// Executes a SQL WHERE query using a LINQ expression predicate.
+        /// Translates the expression into SQL for server-side filtering.
+        /// Example: table.Where(p => p.IsActive && p.Price > 100)
+        /// </summary>
+        public IEnumerable<T> Where(Expression<Func<T, bool>> predicate)
+        {
+            var mapping = MappingCache.GetMapping<T>();
+            var builder = new WhereBuilder(mapping);
+            var (whereSql, parameters) = builder.Build(predicate);
+
+            var selectSql = SqlGenerator.GenerateSelectAll(mapping);
+            var fullSql = $"{selectSql} WHERE {whereSql}";
+
+            _context.EnsureConnectionOpen();
+
+            var dp = new DynamicParameters();
+            foreach (var kv in parameters)
+                dp.Add(kv.Key, kv.Value);
+
+            var results = _context.Connection.Query<T>(fullSql, dp,
+                transaction: _context.Transaction,
+                commandTimeout: _context.CommandTimeout).ToList();
+
+            // Track loaded entities for update detection
+            if (_context.ObjectTrackingEnabled)
+            {
+                foreach (var entity in results)
+                    _changeTracker.TrackLoaded(entity, mapping);
+            }
+
+            return results;
+        }
+
         /// <summary>
         /// Returns an IQueryable&lt;T&gt; for composing LINQ queries.
         /// Queries will be loaded from DB via Dapper when enumerated.
         /// </summary>
         public IQueryable<T> AsQueryable()
         {
-            // Phase 1: Load all rows then return as IQueryable for in-memory filtering.
-            // Phase 2: Replace with custom IQueryProvider for SQL translation.
             return GetAll().AsQueryable();
         }
 
@@ -87,14 +127,24 @@ namespace LiteSql
         /// </summary>
         private List<T> GetAll()
         {
-            return _context.ExecuteQuery<T>(
-                Sql.SqlGenerator.GenerateSelectAll(MappingCache.GetMapping<T>())
+            var results = _context.ExecuteQuery<T>(
+                SqlGenerator.GenerateSelectAll(MappingCache.GetMapping<T>())
             ).ToList();
+
+            // Track loaded entities for update detection
+            if (_context.ObjectTrackingEnabled)
+            {
+                var mapping = MappingCache.GetMapping<T>();
+                foreach (var entity in results)
+                    _changeTracker.TrackLoaded(entity, mapping);
+            }
+
+            return results;
         }
 
         /// <summary>
         /// Enumerates all rows from the database table.
-        /// Phase 1: Loads all data into memory via Dapper.
+        /// Loads all data into memory via Dapper and tracks for updates.
         /// </summary>
         public IEnumerator<T> GetEnumerator()
         {
@@ -105,5 +155,7 @@ namespace LiteSql
         {
             return GetEnumerator();
         }
+
+        #endregion
     }
 }

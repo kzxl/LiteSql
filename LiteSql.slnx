@@ -1,5 +1,6 @@
 <Solution>
   <Folder Name="/src/">
+    <Project Path="src/LiteSql.CodeGen/LiteSql.CodeGen.csproj" />
     <Project Path="src/LiteSql/LiteSql.csproj" />
   </Folder>
   <Folder Name="/tests/">

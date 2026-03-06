@@ -121,6 +121,9 @@ namespace LiteSql
         {
             ThrowIfDisposed();
 
+            // Detect updated entities from snapshots before getting pending changes
+            DetectAllChanges();
+
             var changes = _changeTracker.GetPendingChanges();
             if (changes.Count == 0) return;
 
@@ -140,6 +143,10 @@ namespace LiteSql
                     {
                         case EntityState.Insert:
                             ExecuteInsert(mapping, tracked.Entity, transaction);
+                            break;
+
+                        case EntityState.Update:
+                            ExecuteUpdate(mapping, tracked.Entity, transaction);
                             break;
 
                         case EntityState.Delete:
@@ -258,6 +265,32 @@ namespace LiteSql
                 transaction: transaction, commandTimeout: CommandTimeout);
         }
 
+        private void ExecuteUpdate(EntityMapping mapping, object entity, IDbTransaction transaction)
+        {
+            var (sql, parameters) = SqlGenerator.GenerateUpdate(mapping, entity);
+
+            LogSql(sql, parameters);
+
+            Connection.Execute(sql, (object)ToDynamicParameters(parameters),
+                transaction: transaction, commandTimeout: CommandTimeout);
+        }
+
+        /// <summary>
+        /// Detects changes across all tracked entity types by comparing
+        /// current property values against original snapshots.
+        /// </summary>
+        private void DetectAllChanges()
+        {
+            // Get all unique entity types from the table cache
+            foreach (var tableType in _tables.Keys)
+            {
+                var mapping = MappingCache.GetMapping(tableType);
+                var updates = _changeTracker.DetectChanges(mapping);
+                if (updates.Count > 0)
+                    _changeTracker.AddUpdates(updates);
+            }
+        }
+
         private DynamicParameters ToDynamicParameters(IDictionary<string, object> parameters)
         {
             var dp = new DynamicParameters();
@@ -271,7 +304,7 @@ namespace LiteSql
             return dp;
         }
 
-        private void EnsureConnectionOpen()
+        internal void EnsureConnectionOpen()
         {
             if (Connection.State != ConnectionState.Open)
             {
