@@ -433,37 +433,57 @@ LiteSql is designed as a **lightweight L2S replacement**, not a full-featured OR
 - [x] **Phase 5** — Database Schema CodeGen
 - [x] **Phase 6** — FK Navigation, Include API, Performance Tests
 
-### Planned
+### Planned (priority order)
 
-- [ ] **Phase 7 — Extended LINQ**
-  - `Select(x => new { ... })` — Projection queries
-  - `OrderBy()` / `OrderByDescending()` / `ThenBy()`
+- [ ] **Phase 7 — Extended LINQ** ⭐ High Priority
+  - `OrderBy()` / `OrderByDescending()` / `ThenBy()` — Sorting
   - `Skip()` / `Take()` — Pagination
-  - `Distinct()`, `Max()`, `Min()`, `Sum()`, `Average()`
-- [ ] **Phase 8 — Bulk Operations**
+  - `Select(x => new { ... })` — Projection queries
+  - `Distinct()`, `Max()`, `Min()`, `Sum()`, `Average()` — Aggregates
+  - Compiled query cache — Cache expression → SQL for repeated queries
+- [ ] **Phase 8 — Bulk & Batch Operations** ⭐ High Priority
   - `InsertAllOnSubmit(IEnumerable<T>)` with `SqlBulkCopy` backend
   - `BulkInsert<T>(IEnumerable<T>)` — Direct bulk insert (no tracking)
   - `BulkUpdate<T>()`, `BulkDelete<T>()` — Batch DML
-- [ ] **Phase 9 — Collection Navigation**
-  - One-to-many navigation (`Order.OrderDetails`)
-  - `Include(x => x.Children)` for collections
-  - Nested `ThenInclude()` for multi-level loading
-- [ ] **Phase 10 — Transaction Helpers**
-  - `db.ExecuteInTransaction(action)` — Auto commit/rollback
+  - Batch command execution — Combine multiple commands per roundtrip
+  - `InsertAndGetId<T>()` — Insert and return generated identity
+- [ ] **Phase 9 — Transaction & Unit of Work**
+  - `db.ExecuteInTransaction(action)` — Auto commit/rollback wrapper
   - `db.ExecuteInTransactionAsync(func)` — Async variant
   - `Savepoint` support for nested operations
-- [ ] **Phase 11 — ChangeTracker API**
-  - `db.ChangeTracker.Entries<T>()` — Query tracked entities
+  - Improved `SubmitChanges()` batching — Group insert/update/delete by type
+- [ ] **Phase 10 — ChangeTracker & Entity State**
   - `EntityState` enum: `Unchanged`, `Added`, `Modified`, `Deleted`
-  - `db.ChangeTracker.HasChanges()` — Quick check
-- [ ] **Phase 12 — Quality of Life**
-  - `InsertAndGetId<T>()` — Insert and return generated identity
-  - `Upsert<T>()` — Insert or update (MERGE)
+  - `db.ChangeTracker.Entries<T>()` — Query tracked entities and their states
+  - `db.ChangeTracker.HasChanges()` — Quick dirty check
+  - Automatic update detection — Detect changed properties only
+- [ ] **Phase 11 — Relationship & Navigation**
+  - One-to-many navigation (`Order.OrderDetails`)
+  - `Include(x => x.Children)` for collection loading
+  - `ThenInclude()` — Nested multi-level eager loading
+  - Graph insert — Save parent + children in one `SubmitChanges()` (1 level)
+- [ ] **Phase 12 — Hooks & Filters**
+  - `BeforeSave` / `AfterSave` interceptor hooks
+  - Global query filters — Soft delete (`IsDeleted = false`), multi-tenant
+  - Audit auto-fill — `CreatedDate`, `UpdatedDate`, `CreatedBy` on save
+  - Value converters — Enum ↔ string, JSON column mapping
+- [ ] **Phase 13 — Quality of Life**
+  - `Upsert<T>()` — Insert or update (MERGE / ON CONFLICT)
   - `ExecuteScalar<T>()` — Single value queries
-  - `Exists<T>(predicate)` — Alias for `Any()` with better SQL
+  - PostgreSQL provider support
+  - Enhanced logging & diagnostics — Query timing, parameter logging
 
-> **Note:** Phases are prioritized by real-world usage needs. Phase 7-8 are highest priority.
-> Migration and full IQueryable are explicitly **not planned** — use external tools for schema management and `ExecuteQuery<T>()` for complex SQL.
+### Not Planned
+
+| Feature | Reason |
+|---|---|
+| Full IQueryable / LINQ Provider | Complexity too high for micro ORM. Use `ExecuteQuery<T>()` for complex SQL |
+| Schema Migration | Use external tools: DbUp, FluentMigrator, or SQL scripts |
+| Lazy Loading (proxy generation) | Over-engineering, EF Core also recommends avoiding it |
+| Fluent Mapping API | Attribute mapping + convention is sufficient |
+| Many-to-many relationships | Rare in current codebase. Handle with raw SQL or junction table queries |
+| Sharding / Distributed transactions | Application-level concern, not ORM responsibility |
+| Second-level cache | Use Redis or `MemoryCache` at application layer |
 
 ---
 
@@ -558,13 +578,14 @@ LiteSql được thiết kế là **thay thế nhẹ cho L2S**, không phải OR
 - [x] **Phase 5** — Database Schema CodeGen
 - [x] **Phase 6** — FK Navigation, Include API, Performance Tests
 
-### Dự kiến
+### Dự kiến (theo độ ưu tiên)
 
-- [ ] **Phase 7 — Mở rộng LINQ** — `Select()`, `OrderBy()`, `Skip()`/`Take()`, aggregate
-- [ ] **Phase 8 — Bulk Operations** — `SqlBulkCopy`, `BulkUpdate`, `BulkDelete`
-- [ ] **Phase 9 — Collection Navigation** — One-to-many, `ThenInclude()`
-- [ ] **Phase 10 — Transaction Helpers** — `ExecuteInTransaction()`, Savepoint
-- [ ] **Phase 11 — ChangeTracker API** — `Entries<T>()`, `EntityState`, `HasChanges()`
-- [ ] **Phase 12 — Tiện ích** — `InsertAndGetId()`, `Upsert()`, `ExecuteScalar()`
+- [ ] **Phase 7 — Mở rộng LINQ** ⭐ — `OrderBy()`, `Skip()`/`Take()`, `Select()`, aggregates, query cache
+- [ ] **Phase 8 — Bulk & Batch** ⭐ — `SqlBulkCopy`, `BulkUpdate`, `BulkDelete`, `InsertAndGetId()`
+- [ ] **Phase 9 — Transaction & Unit of Work** — `ExecuteInTransaction()`, Savepoint, batch submit
+- [ ] **Phase 10 — ChangeTracker & Entity State** — `EntityState`, `Entries<T>()`, `HasChanges()`
+- [ ] **Phase 11 — Relationship & Navigation** — One-to-many, `ThenInclude()`, graph insert
+- [ ] **Phase 12 — Hooks & Filters** — `BeforeSave`/`AfterSave`, soft delete filter, audit auto-fill
+- [ ] **Phase 13 — Tiện ích** — `Upsert()`, `ExecuteScalar()`, PostgreSQL, diagnostics
 
-> **Ghi chú:** Migration và Full IQueryable **không nằm trong kế hoạch** — dùng công cụ ngoài (DbUp, FluentMigrator) cho schema và `ExecuteQuery<T>()` cho SQL phức tạp.
+> **Ghi chú:** Lazy loading, schema migration, full IQueryable, sharding **không nằm trong kế hoạch** — dùng công cụ ngoài hoặc giải pháp application-level thay thế.
