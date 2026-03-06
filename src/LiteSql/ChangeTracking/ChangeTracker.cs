@@ -51,6 +51,31 @@ namespace LiteSql.ChangeTracking
         }
 
         /// <summary>
+        /// Tracks an entity using another entity's values as the original snapshot.
+        /// Used by Attach(entity, original) to set the baseline for change detection.
+        /// </summary>
+        public void TrackLoadedWithOriginal(object entity, object original, EntityMapping mapping)
+        {
+            if (entity == null) return;
+
+            var snapshot = new Dictionary<string, object>();
+            foreach (var col in mapping.Columns)
+            {
+                snapshot[col.Property.Name] = col.Property.GetValue(original);
+            }
+            _originalValues[entity] = snapshot;
+        }
+
+        /// <summary>
+        /// Explicitly marks an entity as modified (for Attach with asModified=true).
+        /// </summary>
+        public void TrackUpdate(object entity, Type entityType)
+        {
+            if (entity == null) return;
+            _trackedEntities.Add(new TrackedEntity(entity, entityType, EntityState.Update));
+        }
+
+        /// <summary>
         /// Detects modified entities by comparing current values against original snapshots.
         /// Returns tracked entities with state=Update for any entity whose property values changed.
         /// </summary>
