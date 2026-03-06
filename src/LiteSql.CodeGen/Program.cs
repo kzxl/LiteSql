@@ -1,21 +1,15 @@
 using System;
 using System.IO;
+using Microsoft.Data.SqlClient;
 
 namespace LiteSql.CodeGen
 {
     /// <summary>
-    /// CLI entry point for LiteSql DBML Code Generator.
+    /// CLI entry point for LiteSql Code Generator.
     /// 
-    /// Usage:
-    ///   litesql-codegen &lt;input.dbml&gt; [options]
-    /// 
-    /// Options:
-    ///   -o, --output &lt;path&gt;       Output .cs file path (default: {ContextClass}.designer.cs)
-    ///   -n, --namespace &lt;ns&gt;      Target namespace (default: Models)
-    /// 
-    /// Examples:
-    ///   litesql-codegen dbRAF.dbml
-    ///   litesql-codegen dbRAF.dbml -o Models/dbRAF.cs -n RAF.Models
+    /// Two modes:
+    ///   1. From DBML:  litesql-codegen input.dbml [options]
+    ///   2. From DB:    litesql-codegen --connection "Server=...;Database=..." [options]
     /// </summary>
     class Program
     {
@@ -27,50 +21,70 @@ namespace LiteSql.CodeGen
                 return args.Length == 0 ? 1 : 0;
             }
 
-            var inputPath = args[0];
             var outputPath = "";
             var targetNamespace = "Models";
+            var connectionString = "";
+            var contextName = "";
+            var inputPath = "";
 
-            // Parse arguments
-            for (int i = 1; i < args.Length; i++)
+            // Detect mode
+            if (args[0] == "--connection" || args[0] == "-c")
             {
-                switch (args[i])
-                {
-                    case "-o":
-                    case "--output":
-                        if (i + 1 < args.Length) outputPath = args[++i];
-                        break;
-                    case "-n":
-                    case "--namespace":
-                        if (i + 1 < args.Length) targetNamespace = args[++i];
-                        break;
-                }
+                if (args.Length < 2) { Console.Error.WriteLine("Error: Missing connection string."); return 1; }
+                connectionString = args[1];
+                ParseOptions(args, 2, ref outputPath, ref targetNamespace, ref contextName);
             }
-
-            // Validate input
-            if (!File.Exists(inputPath))
+            else
             {
-                Console.Error.WriteLine($"Error: File not found: {inputPath}");
-                return 1;
+                inputPath = args[0];
+                ParseOptions(args, 1, ref outputPath, ref targetNamespace, ref contextName);
             }
 
             try
             {
-                // Parse DBML
-                Console.WriteLine($"Parsing: {inputPath}");
-                var model = DbmlParser.Parse(inputPath);
-                Console.WriteLine($"  Database: {model.DatabaseName}");
-                Console.WriteLine($"  Context:  {model.ContextClassName}");
-                Console.WriteLine($"  Tables:   {model.Tables.Count}");
+                DbmlModel model;
 
-                // Determine output path — defaults to {input}.LiteSql.cs
-                // Uses separate filename to avoid overwriting L2S .designer.cs
-                // User can use -o to specify exact output path if needed
-                if (string.IsNullOrEmpty(outputPath))
+                if (!string.IsNullOrEmpty(connectionString))
                 {
-                    var dir = Path.GetDirectoryName(inputPath) ?? ".";
-                    var baseName = Path.GetFileNameWithoutExtension(inputPath);
-                    outputPath = Path.Combine(dir, $"{baseName}.LiteSql.cs");
+                    // Mode 2: Read from SQL Server
+                    Console.WriteLine("Connecting to database...");
+                    using (var conn = new SqlConnection(connectionString))
+                    {
+                        conn.Open();
+                        Console.WriteLine($"  Database: {conn.Database}");
+                        model = DatabaseSchemaReader.ReadSchema(conn, 
+                            string.IsNullOrEmpty(contextName) ? null : contextName);
+                    }
+                    Console.WriteLine($"  Context:  {model.ContextClassName}");
+                    Console.WriteLine($"  Tables:   {model.Tables.Count}");
+
+                    if (string.IsNullOrEmpty(outputPath))
+                        outputPath = $"{model.ContextClassName}.cs";
+                }
+                else
+                {
+                    // Mode 1: Parse DBML file
+                    if (!File.Exists(inputPath))
+                    {
+                        Console.Error.WriteLine($"Error: File not found: {inputPath}");
+                        return 1;
+                    }
+
+                    Console.WriteLine($"Parsing: {inputPath}");
+                    model = DbmlParser.Parse(inputPath);
+                    Console.WriteLine($"  Database: {model.DatabaseName}");
+                    Console.WriteLine($"  Context:  {model.ContextClassName}");
+                    Console.WriteLine($"  Tables:   {model.Tables.Count}");
+
+                    if (!string.IsNullOrEmpty(contextName))
+                        model.ContextClassName = contextName;
+
+                    if (string.IsNullOrEmpty(outputPath))
+                    {
+                        var dir = Path.GetDirectoryName(inputPath) ?? ".";
+                        var baseName = Path.GetFileNameWithoutExtension(inputPath);
+                        outputPath = Path.Combine(dir, $"{baseName}.LiteSql.cs");
+                    }
                 }
 
                 // Generate code
@@ -85,21 +99,23 @@ namespace LiteSql.CodeGen
                 Console.WriteLine($"  Output:   {outputPath}");
                 Console.WriteLine();
                 Console.WriteLine($"Generated {model.Tables.Count} entity classes + 1 DataContext.");
-                Console.WriteLine();
 
-                // Check if L2S .designer.cs file exists
-                var dir2 = Path.GetDirectoryName(inputPath) ?? ".";
-                var baseName2 = Path.GetFileNameWithoutExtension(inputPath);
-                var designerFile = Path.Combine(dir2, $"{baseName2}.designer.cs");
-                if (File.Exists(designerFile) && outputPath != designerFile)
+                // Warn about L2S conflict (DBML mode only)
+                if (!string.IsNullOrEmpty(inputPath))
                 {
-                    Console.WriteLine("NOTE: L2S designer file detected:");
-                    Console.WriteLine($"  {designerFile}");
-                    Console.WriteLine();
-                    Console.WriteLine("To avoid class conflicts, either:");
-                    Console.WriteLine("  1. Exclude the .designer.cs from your project build");
-                    Console.WriteLine("  2. Delete the .designer.cs + .dbml (full migration)");
-                    Console.WriteLine("  3. Re-run with -o to overwrite: -o \"" + designerFile + "\"");
+                    var dir2 = Path.GetDirectoryName(inputPath) ?? ".";
+                    var baseName2 = Path.GetFileNameWithoutExtension(inputPath);
+                    var designerFile = Path.Combine(dir2, $"{baseName2}.designer.cs");
+                    if (File.Exists(designerFile) && outputPath != designerFile)
+                    {
+                        Console.WriteLine();
+                        Console.WriteLine("NOTE: L2S designer file detected:");
+                        Console.WriteLine($"  {designerFile}");
+                        Console.WriteLine("To avoid class conflicts, either:");
+                        Console.WriteLine("  1. Exclude the .designer.cs from your project build");
+                        Console.WriteLine("  2. Delete the .designer.cs + .dbml (full migration)");
+                        Console.WriteLine("  3. Re-run with -o to overwrite: -o \"" + designerFile + "\"");
+                    }
                 }
 
                 Console.WriteLine("Done!");
@@ -112,22 +128,43 @@ namespace LiteSql.CodeGen
             }
         }
 
+        static void ParseOptions(string[] args, int startIdx,
+            ref string output, ref string ns, ref string contextName)
+        {
+            for (int i = startIdx; i < args.Length; i++)
+            {
+                switch (args[i])
+                {
+                    case "-o": case "--output":
+                        if (i + 1 < args.Length) output = args[++i]; break;
+                    case "-n": case "--namespace":
+                        if (i + 1 < args.Length) ns = args[++i]; break;
+                    case "--context":
+                        if (i + 1 < args.Length) contextName = args[++i]; break;
+                }
+            }
+        }
+
         static void PrintUsage()
         {
-            Console.WriteLine("LiteSql Code Generator - Generate LiteSql-compatible entities from DBML");
+            Console.WriteLine("LiteSql Code Generator - Generate LiteSql entities from DBML or SQL Server");
             Console.WriteLine();
             Console.WriteLine("Usage:");
-            Console.WriteLine("  litesql-codegen <input.dbml> [options]");
+            Console.WriteLine("  litesql-codegen <input.dbml> [options]          (from DBML file)");
+            Console.WriteLine("  litesql-codegen -c <connection-string> [options] (from SQL Server)");
             Console.WriteLine();
             Console.WriteLine("Options:");
-            Console.WriteLine("  -o, --output <path>       Output .cs file path (default: {input}.LiteSql.cs)");
+            Console.WriteLine("  -o, --output <path>       Output .cs file path");
             Console.WriteLine("  -n, --namespace <ns>      Target namespace (default: Models)");
+            Console.WriteLine("  -c, --connection <cs>     SQL Server connection string");
+            Console.WriteLine("      --context <name>      Override context class name");
             Console.WriteLine("  -h, --help                Show this help");
             Console.WriteLine();
             Console.WriteLine("Examples:");
             Console.WriteLine("  litesql-codegen dbRAF.dbml");
             Console.WriteLine("  litesql-codegen dbRAF.dbml -o Models/dbRAF.cs -n RAF.Models");
-            Console.WriteLine("  litesql-codegen Data.dbml -o Data.designer.cs   (overwrite L2S file)");
+            Console.WriteLine("  litesql-codegen -c \"Server=.;Database=RAFInventory;Trusted_Connection=true\" -n RAF.Models");
+            Console.WriteLine("  litesql-codegen -c \"Server=.;Database=MyDb;...\" --context MyDataContext -o Models/MyDb.cs");
         }
     }
 }
