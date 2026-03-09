@@ -1,6 +1,7 @@
 using LiteSql.ChangeTracking;
 using LiteSql.Mapping;
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Data;
 using System.Dynamic;
@@ -14,12 +15,17 @@ namespace LiteSql.Sql
     /// </summary>
     public static class SqlGenerator
     {
+        // OPT-2: SQL template caches per entity type
+        private static readonly ConcurrentDictionary<Type, string> _insertSqlCache = new ConcurrentDictionary<Type, string>();
+        private static readonly ConcurrentDictionary<Type, string> _deleteSqlCache = new ConcurrentDictionary<Type, string>();
+        private static readonly ConcurrentDictionary<Type, string> _selectAllCache = new ConcurrentDictionary<Type, string>();
         /// <summary>
         /// Generates a SELECT * statement for the entity type.
         /// </summary>
         public static string GenerateSelectAll(EntityMapping mapping)
         {
-            return $"SELECT * FROM {QuoteTableName(mapping.TableName)}";
+            return _selectAllCache.GetOrAdd(mapping.EntityType,
+                _ => $"SELECT * FROM {QuoteTableName(mapping.TableName)}");
         }
 
         /// <summary>
@@ -30,17 +36,16 @@ namespace LiteSql.Sql
         public static (string Sql, IDictionary<string, object> Parameters) GenerateInsert(
             EntityMapping mapping, object entity)
         {
-            var columns = mapping.InsertableColumns;
-            var columnNames = columns.Select(c => $"[{c.ColumnName}]");
-            var paramNames = columns.Select(c => $"@{c.ColumnName}");
+            var sql = _insertSqlCache.GetOrAdd(mapping.EntityType, _ =>
+            {
+                var columns = mapping.InsertableColumns;
+                var columnNames = columns.Select(c => $"[{c.ColumnName}]");
+                var paramNames = columns.Select(c => $"@{c.ColumnName}");
+                return $"INSERT INTO {QuoteTableName(mapping.TableName)} ({string.Join(", ", columnNames)}) " +
+                       $"VALUES ({string.Join(", ", paramNames)})";
+            });
 
-            var sql = $"INSERT INTO {QuoteTableName(mapping.TableName)} ({string.Join(", ", columnNames)}) " +
-                      $"VALUES ({string.Join(", ", paramNames)})";
-
-            // Identity retrieval is handled separately by LiteContext.ExecuteInsert
-            // to support different DB backends (SQL Server, SQLite, etc.)
-
-            var parameters = BuildParameters(columns, entity);
+            var parameters = BuildParameters(mapping.InsertableColumns, entity);
             return (sql, parameters);
         }
 
@@ -54,9 +59,17 @@ namespace LiteSql.Sql
                 throw new InvalidOperationException(
                     $"Cannot generate DELETE for '{mapping.EntityType.Name}': no primary key defined.");
 
-            var whereClause = BuildWhereByPrimaryKeys(mapping, entity, out var parameters);
-            var sql = $"DELETE FROM {QuoteTableName(mapping.TableName)} WHERE {whereClause}";
-            return (sql, parameters);
+            var sqlTemplate = _deleteSqlCache.GetOrAdd(mapping.EntityType, _ =>
+            {
+                var pkClauses = mapping.PrimaryKeys.Select(pk => $"[{pk.ColumnName}] = @pk_{pk.ColumnName}");
+                return $"DELETE FROM {QuoteTableName(mapping.TableName)} WHERE {string.Join(" AND ", pkClauses)}";
+            });
+
+            var parameters = new Dictionary<string, object>();
+            foreach (var pk in mapping.PrimaryKeys)
+                parameters[$"@pk_{pk.ColumnName}"] = pk.Property.GetValue(entity);
+
+            return (sqlTemplate, parameters);
         }
 
         /// <summary>
@@ -89,6 +102,39 @@ namespace LiteSql.Sql
             {
                 allParams[kv.Key] = kv.Value;
             }
+
+            return (sql, allParams);
+        }
+
+        /// <summary>
+        /// Generates a partial UPDATE statement — only SET columns that have changed.
+        /// Used by dirty update feature when ChangedProperties is available.
+        /// </summary>
+        public static (string Sql, IDictionary<string, object> Parameters) GeneratePartialUpdate(
+            EntityMapping mapping, object entity, IReadOnlyList<string> changedProperties)
+        {
+            if (mapping.PrimaryKeys.Count == 0)
+                throw new InvalidOperationException(
+                    $"Cannot generate UPDATE for '{mapping.EntityType.Name}': no primary key defined.");
+
+            // Filter updatable columns to only changed ones
+            var changedColumns = mapping.UpdatableColumns
+                .Where(c => changedProperties.Contains(c.Property.Name))
+                .ToList();
+
+            if (changedColumns.Count == 0)
+                return (null, null); // No changes to persist
+
+            var setClauses = changedColumns.Select(c => $"[{c.ColumnName}] = @{c.ColumnName}");
+            var whereClause = BuildWhereByPrimaryKeys(mapping, entity, out var whereParams);
+
+            var sql = $"UPDATE {QuoteTableName(mapping.TableName)} " +
+                      $"SET {string.Join(", ", setClauses)} " +
+                      $"WHERE {whereClause}";
+
+            var allParams = BuildParameters(changedColumns, entity);
+            foreach (var kv in whereParams)
+                allParams[kv.Key] = kv.Value;
 
             return (sql, allParams);
         }

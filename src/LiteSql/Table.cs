@@ -22,6 +22,9 @@ namespace LiteSql
         private readonly LiteContext _context;
         private readonly ChangeTracker _changeTracker;
         private bool _noTracking;
+        private List<string> _orderByClauses;
+        private int? _skip;
+        private int? _take;
 
         internal Table(LiteContext context, ChangeTracker changeTracker)
         {
@@ -103,6 +106,76 @@ namespace LiteSql
 
         #endregion
 
+        #region OrderBy / ThenBy
+
+        /// <summary>
+        /// Sorts the results in ascending order by the specified column.
+        /// Chain with Where(), ToList(), FirstOrDefault() etc.
+        /// Example: db.GetTable&lt;T&gt;().OrderBy(x => x.Date).Where(x => x.Active)
+        /// </summary>
+        public Table<T> OrderBy<TKey>(Expression<Func<T, TKey>> keySelector)
+        {
+            _orderByClauses = new List<string>();
+            _orderByClauses.Add($"[{ExtractColumnName(keySelector)}] ASC");
+            return this;
+        }
+
+        /// <summary>
+        /// Sorts the results in descending order by the specified column.
+        /// </summary>
+        public Table<T> OrderByDescending<TKey>(Expression<Func<T, TKey>> keySelector)
+        {
+            _orderByClauses = new List<string>();
+            _orderByClauses.Add($"[{ExtractColumnName(keySelector)}] DESC");
+            return this;
+        }
+
+        /// <summary>
+        /// Adds a secondary ascending sort. Must be called after OrderBy/OrderByDescending.
+        /// </summary>
+        public Table<T> ThenBy<TKey>(Expression<Func<T, TKey>> keySelector)
+        {
+            if (_orderByClauses == null)
+                throw new InvalidOperationException("ThenBy must be called after OrderBy or OrderByDescending.");
+            _orderByClauses.Add($"[{ExtractColumnName(keySelector)}] ASC");
+            return this;
+        }
+
+        /// <summary>
+        /// Adds a secondary descending sort. Must be called after OrderBy/OrderByDescending.
+        /// </summary>
+        public Table<T> ThenByDescending<TKey>(Expression<Func<T, TKey>> keySelector)
+        {
+            if (_orderByClauses == null)
+                throw new InvalidOperationException("ThenByDescending must be called after OrderBy or OrderByDescending.");
+            _orderByClauses.Add($"[{ExtractColumnName(keySelector)}] DESC");
+            return this;
+        }
+
+        #endregion
+
+        #region Skip / Take
+
+        /// <summary>
+        /// Skips N rows. For SQL Server, OrderBy is required.
+        /// </summary>
+        public Table<T> Skip(int count)
+        {
+            _skip = count;
+            return this;
+        }
+
+        /// <summary>
+        /// Takes at most N rows.
+        /// </summary>
+        public Table<T> Take(int count)
+        {
+            _take = count;
+            return this;
+        }
+
+        #endregion
+
         #region Include (selective FK loading)
 
         /// <summary>
@@ -132,7 +205,7 @@ namespace LiteSql
         /// <summary>
         /// Server-side WHERE using LINQ expression predicate.
         /// </summary>
-        public IEnumerable<T> Where(Expression<Func<T, bool>> predicate)
+        public List<T> Where(Expression<Func<T, bool>> predicate)
         {
             return ExecuteWhere(predicate);
         }
@@ -142,7 +215,19 @@ namespace LiteSql
         /// </summary>
         public T FirstOrDefault(Expression<Func<T, bool>> predicate)
         {
-            return ExecuteWhere(predicate, top: 1).FirstOrDefault();
+            if (_take == null) _take = 1;
+            return ExecuteWhere(predicate).FirstOrDefault();
+        }
+
+        /// <summary>
+        /// Executes the current query and returns all matching rows as a List.
+        /// Respects OrderBy/Skip/Take if set.
+        /// </summary>
+        public List<T> ToList()
+        {
+            if (_orderByClauses != null || _skip.HasValue || _take.HasValue)
+                return ExecuteWhere(null);
+            return GetAll();
         }
 
         /// <summary>
@@ -191,7 +276,8 @@ namespace LiteSql
         /// </summary>
         public async Task<T> FirstOrDefaultAsync(Expression<Func<T, bool>> predicate, CancellationToken ct = default)
         {
-            var results = await ExecuteWhereAsync(predicate, top: 1, ct: ct).ConfigureAwait(false);
+            if (_take == null) _take = 1;
+            var results = await ExecuteWhereAsync(predicate, ct: ct).ConfigureAwait(false);
             return results.FirstOrDefault();
         }
 
@@ -220,10 +306,13 @@ namespace LiteSql
         }
 
         /// <summary>
-        /// Async load all rows.
+        /// Async load all rows. Respects OrderBy/Skip/Take if set.
         /// </summary>
         public async Task<List<T>> ToListAsync(CancellationToken ct = default)
         {
+            if (_orderByClauses != null || _skip.HasValue || _take.HasValue)
+                return await ExecuteWhereAsync(null, ct: ct).ConfigureAwait(false);
+
             await _context.EnsureConnectionOpenAsync(ct).ConfigureAwait(false);
             var mapping = MappingCache.GetMapping<T>();
             var sql = SqlGenerator.GenerateSelectAll(mapping);
@@ -307,10 +396,15 @@ namespace LiteSql
 
         #region Private: Where Execution
 
-        private List<T> ExecuteWhere(Expression<Func<T, bool>> predicate, int? top = null)
+        private List<T> ExecuteWhere(Expression<Func<T, bool>> predicate)
         {
             var mapping = MappingCache.GetMapping<T>();
-            var (fullSql, dp) = BuildWhereSql(mapping, predicate, top);
+            var orderBy = _orderByClauses;
+            var skip = _skip;
+            var take = _take;
+            ResetQueryState();
+
+            var (fullSql, dp) = BuildWhereSql(mapping, predicate, orderBy, skip, take);
             _context.EnsureConnectionOpen();
             var results = _context.Connection.Query<T>(fullSql, dp,
                 transaction: _context.Transaction, commandTimeout: _context.CommandTimeout).ToList();
@@ -320,10 +414,15 @@ namespace LiteSql
         }
 
         private async Task<List<T>> ExecuteWhereAsync(Expression<Func<T, bool>> predicate,
-            int? top = null, CancellationToken ct = default)
+            CancellationToken ct = default)
         {
             var mapping = MappingCache.GetMapping<T>();
-            var (fullSql, dp) = BuildWhereSql(mapping, predicate, top);
+            var orderBy = _orderByClauses;
+            var skip = _skip;
+            var take = _take;
+            ResetQueryState();
+
+            var (fullSql, dp) = BuildWhereSql(mapping, predicate, orderBy, skip, take);
             await _context.EnsureConnectionOpenAsync(ct).ConfigureAwait(false);
             var results = (await _context.Connection.QueryAsync<T>(
                 new CommandDefinition(fullSql, dp, transaction: _context.Transaction,
@@ -334,23 +433,76 @@ namespace LiteSql
         }
 
         private (string sql, DynamicParameters dp) BuildWhereSql(
-            EntityMapping mapping, Expression<Func<T, bool>> predicate, int? top)
+            EntityMapping mapping, Expression<Func<T, bool>> predicate,
+            List<string> orderByClauses, int? skip, int? take)
         {
-            var builder = new WhereBuilder(mapping);
-            var (whereSql, parameters) = builder.Build(predicate);
-            var fullSql = $"{SqlGenerator.GenerateSelectAll(mapping)} WHERE {whereSql}";
+            var selectAll = SqlGenerator.GenerateSelectAll(mapping);
+            IDictionary<string, object> parameters = null;
 
-            if (top.HasValue)
+            string fullSql;
+            if (predicate != null)
             {
-                var isSqlite = _context.Connection.GetType().Name
-                    .IndexOf("sqlite", StringComparison.OrdinalIgnoreCase) >= 0;
+                var builder = new WhereBuilder(mapping);
+                var (whereSql, whereParams) = builder.Build(predicate);
+                parameters = whereParams;
+                fullSql = $"{selectAll} WHERE {whereSql}";
+            }
+            else
+            {
+                fullSql = selectAll;
+            }
+
+            // ORDER BY
+            if (orderByClauses != null && orderByClauses.Count > 0)
+            {
+                fullSql += $" ORDER BY {string.Join(", ", orderByClauses)}";
+            }
+
+            // Pagination
+            var isSqlite = _context.Connection.GetType().Name
+                .IndexOf("sqlite", StringComparison.OrdinalIgnoreCase) >= 0;
+
+            if (skip.HasValue || take.HasValue)
+            {
                 if (isSqlite)
-                    fullSql += $" LIMIT {top.Value}";
+                {
+                    // SQLite: LIMIT {take} OFFSET {skip}
+                    if (take.HasValue)
+                        fullSql += $" LIMIT {take.Value}";
+                    else
+                        fullSql += " LIMIT -1"; // unlimited
+                    if (skip.HasValue)
+                        fullSql += $" OFFSET {skip.Value}";
+                }
                 else
-                    fullSql = fullSql.Replace("SELECT ", $"SELECT TOP {top.Value} ");
+                {
+                    // SQL Server: OFFSET ... ROWS FETCH NEXT ... ROWS ONLY
+                    // ORDER BY is required for OFFSET/FETCH
+                    if (orderByClauses == null || orderByClauses.Count == 0)
+                        fullSql += " ORDER BY (SELECT NULL)";
+
+                    fullSql += $" OFFSET {skip ?? 0} ROWS";
+                    if (take.HasValue)
+                        fullSql += $" FETCH NEXT {take.Value} ROWS ONLY";
+                }
+            }
+            else if (take.HasValue && orderByClauses == null)
+            {
+                // Legacy TOP behavior for FirstOrDefault without OrderBy
+                if (isSqlite)
+                    fullSql += $" LIMIT {take.Value}";
+                else
+                    fullSql = fullSql.Replace("SELECT ", $"SELECT TOP {take.Value} ");
             }
 
             return (fullSql, ToDp(parameters));
+        }
+
+        private void ResetQueryState()
+        {
+            _orderByClauses = null;
+            _skip = null;
+            _take = null;
         }
 
         #endregion
@@ -572,6 +724,29 @@ namespace LiteSql
         private static object GetDefault(Type type)
         {
             return type.IsValueType ? Activator.CreateInstance(type) : null;
+        }
+
+        /// <summary>
+        /// Extracts the database column name from a member access expression.
+        /// Uses MappingCache to resolve [Column(Name=...)] attribute.
+        /// </summary>
+        internal static string ExtractColumnName<TKey>(Expression<Func<T, TKey>> expression)
+        {
+            var body = expression.Body;
+            // Handle Convert (boxing) for value types
+            if (body is UnaryExpression unary && unary.NodeType == ExpressionType.Convert)
+                body = unary.Operand;
+
+            if (body is MemberExpression member)
+            {
+                var propertyName = member.Member.Name;
+                var mapping = MappingCache.GetMapping<T>();
+                var col = mapping.Columns.FirstOrDefault(c => c.Property.Name == propertyName);
+                return col?.ColumnName ?? propertyName;
+            }
+
+            throw new ArgumentException(
+                $"Expression must be a member access (e.g. x => x.Property), got: {expression}");
         }
 
         #endregion

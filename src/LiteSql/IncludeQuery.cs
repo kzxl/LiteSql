@@ -23,6 +23,9 @@ namespace LiteSql
         private readonly LiteContext _context;
         private readonly ChangeTracker _changeTracker;
         private readonly List<PropertyInfo> _includes = new List<PropertyInfo>();
+        private List<string> _orderByClauses;
+        private int? _skip;
+        private int? _take;
 
         internal IncludeQuery(Table<T> table, LiteContext context, ChangeTracker changeTracker)
         {
@@ -42,18 +45,77 @@ namespace LiteSql
             return this;
         }
 
+        #region OrderBy / ThenBy
+
+        /// <summary>
+        /// Sorts results in ascending order.
+        /// </summary>
+        public IncludeQuery<T> OrderBy<TKey>(Expression<Func<T, TKey>> keySelector)
+        {
+            _orderByClauses = new List<string>();
+            _orderByClauses.Add($"[{Table<T>.ExtractColumnName(keySelector)}] ASC");
+            return this;
+        }
+
+        /// <summary>
+        /// Sorts results in descending order.
+        /// </summary>
+        public IncludeQuery<T> OrderByDescending<TKey>(Expression<Func<T, TKey>> keySelector)
+        {
+            _orderByClauses = new List<string>();
+            _orderByClauses.Add($"[{Table<T>.ExtractColumnName(keySelector)}] DESC");
+            return this;
+        }
+
+        /// <summary>
+        /// Adds a secondary ascending sort.
+        /// </summary>
+        public IncludeQuery<T> ThenBy<TKey>(Expression<Func<T, TKey>> keySelector)
+        {
+            if (_orderByClauses == null)
+                throw new InvalidOperationException("ThenBy must be called after OrderBy or OrderByDescending.");
+            _orderByClauses.Add($"[{Table<T>.ExtractColumnName(keySelector)}] ASC");
+            return this;
+        }
+
+        /// <summary>
+        /// Adds a secondary descending sort.
+        /// </summary>
+        public IncludeQuery<T> ThenByDescending<TKey>(Expression<Func<T, TKey>> keySelector)
+        {
+            if (_orderByClauses == null)
+                throw new InvalidOperationException("ThenByDescending must be called after OrderBy or OrderByDescending.");
+            _orderByClauses.Add($"[{Table<T>.ExtractColumnName(keySelector)}] DESC");
+            return this;
+        }
+
+        #endregion
+
+        #region Skip / Take
+
+        /// <summary>
+        /// Skips N rows.
+        /// </summary>
+        public IncludeQuery<T> Skip(int count) { _skip = count; return this; }
+
+        /// <summary>
+        /// Takes at most N rows.
+        /// </summary>
+        public IncludeQuery<T> Take(int count) { _take = count; return this; }
+
+        #endregion
+
+        #region Terminal Methods (Sync)
+
         /// <summary>
         /// Filters entities with a predicate, loading only specified FK associations.
         /// </summary>
         public List<T> Where(Expression<Func<T, bool>> predicate)
         {
             var mapping = MappingCache.GetMapping<T>();
-            var builder = new WhereBuilder(mapping);
-            var (whereSql, parameters) = builder.Build(predicate);
-            var fullSql = $"{SqlGenerator.GenerateSelectAll(mapping)} WHERE {whereSql}";
+            var (fullSql, dp) = BuildSql(mapping, predicate);
 
             _context.EnsureConnectionOpen();
-            var dp = ToDp(parameters);
             var results = _context.Connection.Query<T>(fullSql, dp,
                 transaction: _context.Transaction, commandTimeout: _context.CommandTimeout).ToList();
             TrackResults(results, mapping);
@@ -62,44 +124,15 @@ namespace LiteSql
         }
 
         /// <summary>
-        /// Async Where with selective FK loading.
-        /// </summary>
-        public async Task<List<T>> WhereAsync(Expression<Func<T, bool>> predicate,
-            CancellationToken ct = default)
-        {
-            var mapping = MappingCache.GetMapping<T>();
-            var builder = new WhereBuilder(mapping);
-            var (whereSql, parameters) = builder.Build(predicate);
-            var fullSql = $"{SqlGenerator.GenerateSelectAll(mapping)} WHERE {whereSql}";
-
-            await _context.EnsureConnectionOpenAsync(ct).ConfigureAwait(false);
-            var dp = ToDp(parameters);
-            var results = (await _context.Connection.QueryAsync<T>(
-                new CommandDefinition(fullSql, dp, transaction: _context.Transaction,
-                    commandTimeout: _context.CommandTimeout, cancellationToken: ct))
-                .ConfigureAwait(false)).ToList();
-            TrackResults(results, mapping);
-            await LoadIncludedAssociationsAsync(results, mapping, ct).ConfigureAwait(false);
-            return results;
-        }
-
-        /// <summary>
         /// Returns first matching entity with selective FK loading.
         /// </summary>
         public T FirstOrDefault(Expression<Func<T, bool>> predicate)
         {
+            if (_take == null) _take = 1;
             var mapping = MappingCache.GetMapping<T>();
-            var builder = new WhereBuilder(mapping);
-            var (whereSql, parameters) = builder.Build(predicate);
-            var fullSql = $"{SqlGenerator.GenerateSelectAll(mapping)} WHERE {whereSql}";
-
-            var isSqlite = _context.Connection.GetType().Name
-                .IndexOf("sqlite", StringComparison.OrdinalIgnoreCase) >= 0;
-            if (isSqlite) fullSql += " LIMIT 1";
-            else fullSql = fullSql.Replace("SELECT ", "SELECT TOP 1 ");
+            var (fullSql, dp) = BuildSql(mapping, predicate);
 
             _context.EnsureConnectionOpen();
-            var dp = ToDp(parameters);
             var entity = _context.Connection.QueryFirstOrDefault<T>(fullSql, dp,
                 transaction: _context.Transaction, commandTimeout: _context.CommandTimeout);
             if (entity != null)
@@ -111,23 +144,47 @@ namespace LiteSql
         }
 
         /// <summary>
+        /// Executes query respecting OrderBy/Skip/Take and loads included FKs.
+        /// </summary>
+        public List<T> ToList()
+        {
+            return Where(null);
+        }
+
+        #endregion
+
+        #region Terminal Methods (Async)
+
+        /// <summary>
+        /// Async Where with selective FK loading.
+        /// </summary>
+        public async Task<List<T>> WhereAsync(Expression<Func<T, bool>> predicate,
+            CancellationToken ct = default)
+        {
+            var mapping = MappingCache.GetMapping<T>();
+            var (fullSql, dp) = BuildSql(mapping, predicate);
+
+            await _context.EnsureConnectionOpenAsync(ct).ConfigureAwait(false);
+            var results = (await _context.Connection.QueryAsync<T>(
+                new CommandDefinition(fullSql, dp, transaction: _context.Transaction,
+                    commandTimeout: _context.CommandTimeout, cancellationToken: ct))
+                .ConfigureAwait(false)).ToList();
+            TrackResults(results, mapping);
+            await LoadIncludedAssociationsAsync(results, mapping, ct).ConfigureAwait(false);
+            return results;
+        }
+
+        /// <summary>
         /// Async FirstOrDefault with selective FK loading.
         /// </summary>
         public async Task<T> FirstOrDefaultAsync(Expression<Func<T, bool>> predicate,
             CancellationToken ct = default)
         {
+            if (_take == null) _take = 1;
             var mapping = MappingCache.GetMapping<T>();
-            var builder = new WhereBuilder(mapping);
-            var (whereSql, parameters) = builder.Build(predicate);
-            var fullSql = $"{SqlGenerator.GenerateSelectAll(mapping)} WHERE {whereSql}";
-
-            var isSqlite = _context.Connection.GetType().Name
-                .IndexOf("sqlite", StringComparison.OrdinalIgnoreCase) >= 0;
-            if (isSqlite) fullSql += " LIMIT 1";
-            else fullSql = fullSql.Replace("SELECT ", "SELECT TOP 1 ");
+            var (fullSql, dp) = BuildSql(mapping, predicate);
 
             await _context.EnsureConnectionOpenAsync(ct).ConfigureAwait(false);
-            var dp = ToDp(parameters);
             var entity = await _context.Connection.QueryFirstOrDefaultAsync<T>(fullSql, dp,
                 transaction: _context.Transaction, commandTimeout: _context.CommandTimeout)
                 .ConfigureAwait(false);
@@ -139,6 +196,16 @@ namespace LiteSql
             }
             return entity;
         }
+
+        /// <summary>
+        /// Async ToList with selective FK loading.
+        /// </summary>
+        public async Task<List<T>> ToListAsync(CancellationToken ct = default)
+        {
+            return await WhereAsync(null, ct).ConfigureAwait(false);
+        }
+
+        #endregion
 
         #region Private Helpers
 
@@ -295,6 +362,57 @@ namespace LiteSql
             if (body is UnaryExpression unary && unary.NodeType == ExpressionType.Convert)
                 body = unary.Operand;
             return body is MemberExpression member && member.Member is PropertyInfo prop ? prop : null;
+        }
+
+        /// <summary>
+        /// Builds the full SQL including WHERE, ORDER BY, and pagination.
+        /// </summary>
+        private (string sql, DynamicParameters dp) BuildSql(
+            EntityMapping mapping, Expression<Func<T, bool>> predicate)
+        {
+            var selectAll = SqlGenerator.GenerateSelectAll(mapping);
+            IDictionary<string, object> parameters = null;
+
+            string fullSql;
+            if (predicate != null)
+            {
+                var builder = new WhereBuilder(mapping);
+                var (whereSql, whereParams) = builder.Build(predicate);
+                parameters = whereParams;
+                fullSql = $"{selectAll} WHERE {whereSql}";
+            }
+            else
+            {
+                fullSql = selectAll;
+            }
+
+            // ORDER BY
+            if (_orderByClauses != null && _orderByClauses.Count > 0)
+                fullSql += $" ORDER BY {string.Join(", ", _orderByClauses)}";
+
+            // Pagination
+            var isSqlite = _context.Connection.GetType().Name
+                .IndexOf("sqlite", StringComparison.OrdinalIgnoreCase) >= 0;
+
+            if (_skip.HasValue || _take.HasValue)
+            {
+                if (isSqlite)
+                {
+                    if (_take.HasValue) fullSql += $" LIMIT {_take.Value}";
+                    else fullSql += " LIMIT -1";
+                    if (_skip.HasValue) fullSql += $" OFFSET {_skip.Value}";
+                }
+                else
+                {
+                    if (_orderByClauses == null || _orderByClauses.Count == 0)
+                        fullSql += " ORDER BY (SELECT NULL)";
+                    fullSql += $" OFFSET {_skip ?? 0} ROWS";
+                    if (_take.HasValue)
+                        fullSql += $" FETCH NEXT {_take.Value} ROWS ONLY";
+                }
+            }
+
+            return (fullSql, ToDp(parameters));
         }
 
         #endregion

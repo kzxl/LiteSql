@@ -1,7 +1,9 @@
 using LiteSql.Mapping;
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
+using System.Linq.Expressions;
 using System.Reflection;
 
 namespace LiteSql.ChangeTracking
@@ -10,12 +12,33 @@ namespace LiteSql.ChangeTracking
     /// Tracks pending Insert, Delete, and Update operations for SubmitChanges().
     /// Update tracking uses snapshot-based comparison: original values are captured
     /// when entities are first loaded, and compared at SubmitChanges() time.
+    /// Uses compiled expression delegates for high performance property access (OPT-1).
     /// </summary>
     public class ChangeTracker
     {
         private readonly List<TrackedEntity> _trackedEntities = new List<TrackedEntity>();
         private readonly Dictionary<object, Dictionary<string, object>> _originalValues
             = new Dictionary<object, Dictionary<string, object>>(ReferenceEqualityComparer.Instance);
+
+        /// <summary>
+        /// Compiled getter cache: avoids slow PropertyInfo.GetValue() reflection.
+        /// Each PropertyInfo is compiled once into a Func&lt;object, object&gt; delegate.
+        /// ~3-5x faster than reflection for repeated property access.
+        /// </summary>
+        private static readonly ConcurrentDictionary<PropertyInfo, Func<object, object>> _getterCache
+            = new ConcurrentDictionary<PropertyInfo, Func<object, object>>();
+
+        private static Func<object, object> GetCompiledGetter(PropertyInfo prop)
+        {
+            return _getterCache.GetOrAdd(prop, p =>
+            {
+                var param = Expression.Parameter(typeof(object));
+                var cast = Expression.Convert(param, p.DeclaringType);
+                var access = Expression.Property(cast, p);
+                var box = Expression.Convert(access, typeof(object));
+                return Expression.Lambda<Func<object, object>>(box, param).Compile();
+            });
+        }
 
         /// <summary>
         /// Marks an entity for insertion.
@@ -45,7 +68,7 @@ namespace LiteSql.ChangeTracking
             var snapshot = new Dictionary<string, object>();
             foreach (var col in mapping.Columns)
             {
-                snapshot[col.Property.Name] = col.Property.GetValue(entity);
+                snapshot[col.Property.Name] = GetCompiledGetter(col.Property)(entity);
             }
             _originalValues[entity] = snapshot;
         }
@@ -61,7 +84,7 @@ namespace LiteSql.ChangeTracking
             var snapshot = new Dictionary<string, object>();
             foreach (var col in mapping.Columns)
             {
-                snapshot[col.Property.Name] = col.Property.GetValue(original);
+                snapshot[col.Property.Name] = GetCompiledGetter(col.Property)(original);
             }
             _originalValues[entity] = snapshot;
         }
@@ -77,7 +100,7 @@ namespace LiteSql.ChangeTracking
 
         /// <summary>
         /// Detects modified entities by comparing current values against original snapshots.
-        /// Returns tracked entities with state=Update for any entity whose property values changed.
+        /// Returns tracked entities with state=Update, including ChangedProperties for dirty update.
         /// </summary>
         public List<TrackedEntity> DetectChanges(EntityMapping mapping)
         {
@@ -91,18 +114,27 @@ namespace LiteSql.ChangeTracking
                 if (entity.GetType() != mapping.EntityType)
                     continue;
 
+                var changedProps = new List<string>();
+
                 foreach (var col in mapping.UpdatableColumns)
                 {
-                    var currentValue = col.Property.GetValue(entity);
+                    var currentValue = GetCompiledGetter(col.Property)(entity);
                     var originalValue = originalSnapshot.ContainsKey(col.Property.Name)
                         ? originalSnapshot[col.Property.Name]
                         : null;
 
                     if (!Equals(currentValue, originalValue))
                     {
-                        updates.Add(new TrackedEntity(entity, mapping.EntityType, EntityState.Update));
-                        break; // Only need to detect one change per entity
+                        changedProps.Add(col.Property.Name);
                     }
+                }
+
+                if (changedProps.Count > 0)
+                {
+                    updates.Add(new TrackedEntity(entity, mapping.EntityType, EntityState.Update)
+                    {
+                        ChangedProperties = changedProps
+                    });
                 }
             }
 
@@ -163,3 +195,4 @@ namespace LiteSql.ChangeTracking
             System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(obj);
     }
 }
+
