@@ -249,6 +249,60 @@ namespace LiteSql
         /// </summary>
         public bool Any(Expression<Func<T, bool>> predicate) => Count(predicate) > 0;
 
+        /// <summary>
+        /// Server-side MAX aggregate.
+        /// </summary>
+        public TResult Max<TResult>(Expression<Func<T, TResult>> selector)
+            => ExecuteAggregate<TResult>("MAX", selector, null);
+
+        /// <summary>
+        /// Server-side MAX with WHERE.
+        /// </summary>
+        public TResult Max<TResult>(Expression<Func<T, TResult>> selector, Expression<Func<T, bool>> predicate)
+            => ExecuteAggregate<TResult>("MAX", selector, predicate);
+
+        /// <summary>
+        /// Server-side MIN aggregate.
+        /// </summary>
+        public TResult Min<TResult>(Expression<Func<T, TResult>> selector)
+            => ExecuteAggregate<TResult>("MIN", selector, null);
+
+        /// <summary>
+        /// Server-side MIN with WHERE.
+        /// </summary>
+        public TResult Min<TResult>(Expression<Func<T, TResult>> selector, Expression<Func<T, bool>> predicate)
+            => ExecuteAggregate<TResult>("MIN", selector, predicate);
+
+        /// <summary>
+        /// Server-side SUM aggregate.
+        /// </summary>
+        public TResult Sum<TResult>(Expression<Func<T, TResult>> selector)
+            => ExecuteAggregate<TResult>("SUM", selector, null);
+
+        /// <summary>
+        /// Server-side SUM with WHERE.
+        /// </summary>
+        public TResult Sum<TResult>(Expression<Func<T, TResult>> selector, Expression<Func<T, bool>> predicate)
+            => ExecuteAggregate<TResult>("SUM", selector, predicate);
+
+        /// <summary>
+        /// Server-side AVERAGE aggregate.
+        /// </summary>
+        public TResult Average<TResult>(Expression<Func<T, TResult>> selector)
+            => ExecuteAggregate<TResult>("AVG", selector, null);
+
+        /// <summary>
+        /// Server-side DISTINCT.
+        /// </summary>
+        public List<T> Distinct()
+        {
+            var mapping = MappingCache.GetMapping<T>();
+            var sql = SqlGenerator.GenerateSelectAll(mapping).Replace("SELECT ", "SELECT DISTINCT ");
+            _context.EnsureConnectionOpen();
+            return _context.Connection.Query<T>(sql,
+                transaction: _context.Transaction, commandTimeout: _context.CommandTimeout).ToList();
+        }
+
         public IQueryable<T> AsQueryable() => GetAll().AsQueryable();
 
         /// <summary>
@@ -321,6 +375,37 @@ namespace LiteSql
         public async Task<bool> AnyAsync(Expression<Func<T, bool>> predicate, CancellationToken ct = default)
         {
             return await CountAsync(predicate, ct).ConfigureAwait(false) > 0;
+        }
+
+        /// <summary>
+        /// Async MAX aggregate.
+        /// </summary>
+        public async Task<TResult> MaxAsync<TResult>(Expression<Func<T, TResult>> selector, CancellationToken ct = default)
+            => await ExecuteAggregateAsync<TResult>("MAX", selector, null, ct).ConfigureAwait(false);
+
+        /// <summary>
+        /// Async MIN aggregate.
+        /// </summary>
+        public async Task<TResult> MinAsync<TResult>(Expression<Func<T, TResult>> selector, CancellationToken ct = default)
+            => await ExecuteAggregateAsync<TResult>("MIN", selector, null, ct).ConfigureAwait(false);
+
+        /// <summary>
+        /// Async SUM aggregate.
+        /// </summary>
+        public async Task<TResult> SumAsync<TResult>(Expression<Func<T, TResult>> selector, CancellationToken ct = default)
+            => await ExecuteAggregateAsync<TResult>("SUM", selector, null, ct).ConfigureAwait(false);
+
+        /// <summary>
+        /// Async DISTINCT.
+        /// </summary>
+        public async Task<List<T>> DistinctAsync(CancellationToken ct = default)
+        {
+            var mapping = MappingCache.GetMapping<T>();
+            var sql = SqlGenerator.GenerateSelectAll(mapping).Replace("SELECT ", "SELECT DISTINCT ");
+            await _context.EnsureConnectionOpenAsync(ct).ConfigureAwait(false);
+            return (await _context.Connection.QueryAsync<T>(
+                new CommandDefinition(sql, transaction: _context.Transaction,
+                    commandTimeout: _context.CommandTimeout, cancellationToken: ct)).ConfigureAwait(false)).ToList();
         }
 
         /// <summary>
@@ -622,6 +707,68 @@ namespace LiteSql
             return (fullSql, ToDp(parameters));
         }
 
+        #endregion
+
+        #region Private: Aggregate Execution
+
+        private TResult ExecuteAggregate<TResult>(string function,
+            LambdaExpression selector, Expression<Func<T, bool>> predicate)
+        {
+            var mapping = MappingCache.GetMapping<T>();
+            var columnName = ExtractColumnNameFromLambda(selector, mapping);
+            var tableName = SqlGenerator.QuoteTableName(mapping.TableName);
+
+            string sql;
+            IDictionary<string, object> parameters = null;
+            if (predicate != null)
+            {
+                var builder = new WhereBuilder(mapping);
+                var (whereSql, whereParams) = builder.Build(predicate);
+                parameters = whereParams;
+                sql = $"SELECT {function}([{columnName}]) FROM {tableName} WHERE {whereSql}";
+            }
+            else
+            {
+                sql = $"SELECT {function}([{columnName}]) FROM {tableName}";
+            }
+
+            _context.EnsureConnectionOpen();
+            return _context.Connection.ExecuteScalar<TResult>(sql, ToDp(parameters),
+                transaction: _context.Transaction, commandTimeout: _context.CommandTimeout);
+        }
+
+        private async Task<TResult> ExecuteAggregateAsync<TResult>(string function,
+            LambdaExpression selector, Expression<Func<T, bool>> predicate, CancellationToken ct)
+        {
+            var mapping = MappingCache.GetMapping<T>();
+            var columnName = ExtractColumnNameFromLambda(selector, mapping);
+            var tableName = SqlGenerator.QuoteTableName(mapping.TableName);
+
+            string sql;
+            IDictionary<string, object> parameters = null;
+            if (predicate != null)
+            {
+                var builder = new WhereBuilder(mapping);
+                var (whereSql, whereParams) = builder.Build(predicate);
+                parameters = whereParams;
+                sql = $"SELECT {function}([{columnName}]) FROM {tableName} WHERE {whereSql}";
+            }
+            else
+            {
+                sql = $"SELECT {function}([{columnName}]) FROM {tableName}";
+            }
+
+            await _context.EnsureConnectionOpenAsync(ct).ConfigureAwait(false);
+            return await _context.Connection.ExecuteScalarAsync<TResult>(
+                new CommandDefinition(sql, ToDp(parameters),
+                    transaction: _context.Transaction, commandTimeout: _context.CommandTimeout,
+                    cancellationToken: ct)).ConfigureAwait(false);
+        }
+
+        #endregion
+
+        #region Private: Query State
+
         private void ResetQueryState()
         {
             _orderByClauses = null;
@@ -848,6 +995,27 @@ namespace LiteSql
         private static object GetDefault(Type type)
         {
             return type.IsValueType ? Activator.CreateInstance(type) : null;
+        }
+
+        /// <summary>
+        /// Extracts column name from a LambdaExpression using provided mapping.
+        /// Used by aggregate helpers.
+        /// </summary>
+        private static string ExtractColumnNameFromLambda(LambdaExpression expression, EntityMapping mapping)
+        {
+            var body = expression.Body;
+            if (body is UnaryExpression unary && unary.NodeType == ExpressionType.Convert)
+                body = unary.Operand;
+
+            if (body is MemberExpression member)
+            {
+                var propertyName = member.Member.Name;
+                var col = mapping.Columns.FirstOrDefault(c => c.Property.Name == propertyName);
+                return col?.ColumnName ?? propertyName;
+            }
+
+            throw new ArgumentException(
+                $"Expression must be a member access (e.g. x => x.Property), got: {expression}");
         }
 
         /// <summary>

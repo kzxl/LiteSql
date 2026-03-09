@@ -257,6 +257,122 @@ namespace LiteSql
 
         #endregion
 
+        #region BulkInsert (Phase 8.1)
+
+        /// <summary>
+        /// Inserts multiple entities directly using batched INSERT VALUES.
+        /// Does not go through ChangeTracker or SubmitChanges.
+        /// Bypasses identity retrieval for maximum throughput.
+        /// </summary>
+        public void BulkInsert<T>(IEnumerable<T> entities, int batchSize = 500) where T : class
+        {
+            if (entities == null) throw new ArgumentNullException(nameof(entities));
+            ThrowIfDisposed();
+            EnsureConnectionOpen();
+
+            var mapping = MappingCache.GetMapping<T>();
+            var columns = mapping.InsertableColumns;
+            var columnNames = string.Join(", ", columns.Select(c => $"[{c.ColumnName}]"));
+            var tableName = SqlGenerator.QuoteTableName(mapping.TableName);
+
+            var ownTx = Transaction == null;
+            var tx = Transaction ?? Connection.BeginTransaction();
+            try
+            {
+                foreach (var batch in Batch(entities, batchSize))
+                {
+                    var dp = new DynamicParameters();
+                    var valueRows = new List<string>();
+                    int idx = 0;
+                    foreach (var entity in batch)
+                    {
+                        var paramNames = new List<string>();
+                        foreach (var col in columns)
+                        {
+                            var paramName = $"@b{idx}_{col.ColumnName}";
+                            paramNames.Add(paramName);
+                            dp.Add(paramName, col.Property.GetValue(entity));
+                        }
+                        valueRows.Add($"({string.Join(", ", paramNames)})");
+                        idx++;
+                    }
+
+                    var sql = $"INSERT INTO {tableName} ({columnNames}) VALUES {string.Join(", ", valueRows)}";
+                    LogSql(sql, null);
+                    Connection.Execute(sql, (object)dp, transaction: tx, commandTimeout: CommandTimeout);
+                }
+                if (ownTx) tx.Commit();
+            }
+            catch { if (ownTx) tx.Rollback(); throw; }
+            finally { if (ownTx) tx.Dispose(); }
+        }
+
+        /// <summary>
+        /// Async version of BulkInsert.
+        /// </summary>
+        public async Task BulkInsertAsync<T>(IEnumerable<T> entities, int batchSize = 500,
+            CancellationToken ct = default) where T : class
+        {
+            if (entities == null) throw new ArgumentNullException(nameof(entities));
+            ThrowIfDisposed();
+            await EnsureConnectionOpenAsync(ct).ConfigureAwait(false);
+
+            var mapping = MappingCache.GetMapping<T>();
+            var columns = mapping.InsertableColumns;
+            var columnNames = string.Join(", ", columns.Select(c => $"[{c.ColumnName}]"));
+            var tableName = SqlGenerator.QuoteTableName(mapping.TableName);
+
+            var ownTx = Transaction == null;
+            var tx = Transaction ?? Connection.BeginTransaction();
+            try
+            {
+                foreach (var batch in Batch(entities, batchSize))
+                {
+                    var dp = new DynamicParameters();
+                    var valueRows = new List<string>();
+                    int idx = 0;
+                    foreach (var entity in batch)
+                    {
+                        var paramNames = new List<string>();
+                        foreach (var col in columns)
+                        {
+                            var paramName = $"@b{idx}_{col.ColumnName}";
+                            paramNames.Add(paramName);
+                            dp.Add(paramName, col.Property.GetValue(entity));
+                        }
+                        valueRows.Add($"({string.Join(", ", paramNames)})");
+                        idx++;
+                    }
+
+                    var sql = $"INSERT INTO {tableName} ({columnNames}) VALUES {string.Join(", ", valueRows)}";
+                    LogSql(sql, null);
+                    await Connection.ExecuteAsync(new CommandDefinition(
+                        sql, (object)dp, transaction: tx, commandTimeout: CommandTimeout,
+                        cancellationToken: ct)).ConfigureAwait(false);
+                }
+                if (ownTx) tx.Commit();
+            }
+            catch { if (ownTx) tx.Rollback(); throw; }
+            finally { if (ownTx) tx.Dispose(); }
+        }
+
+        private static IEnumerable<List<T>> Batch<T>(IEnumerable<T> source, int size)
+        {
+            var batch = new List<T>(size);
+            foreach (var item in source)
+            {
+                batch.Add(item);
+                if (batch.Count >= size)
+                {
+                    yield return batch;
+                    batch = new List<T>(size);
+                }
+            }
+            if (batch.Count > 0) yield return batch;
+        }
+
+        #endregion
+
         #region Change Processing
 
         private void ProcessChanges(IReadOnlyList<TrackedEntity> changes, IDbTransaction tx)
