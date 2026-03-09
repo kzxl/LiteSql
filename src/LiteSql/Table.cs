@@ -251,6 +251,24 @@ namespace LiteSql
 
         public IQueryable<T> AsQueryable() => GetAll().AsQueryable();
 
+        /// <summary>
+        /// Server-side SELECT projection. Translates expression into SQL column list.
+        /// Supports anonymous types, DTOs, and scalar properties.
+        /// </summary>
+        public List<TResult> Select<TResult>(Expression<Func<T, TResult>> selector)
+        {
+            return ExecuteSelect(selector, null);
+        }
+
+        /// <summary>
+        /// Server-side SELECT projection with WHERE clause.
+        /// </summary>
+        public List<TResult> Select<TResult>(Expression<Func<T, TResult>> selector,
+            Expression<Func<T, bool>> predicate)
+        {
+            return ExecuteSelect(selector, predicate);
+        }
+
         #endregion
 
         #region Async Query Methods
@@ -321,6 +339,24 @@ namespace LiteSql
                     commandTimeout: _context.CommandTimeout, cancellationToken: ct)).ConfigureAwait(false)).ToList();
             TrackResults(results, mapping);
             return results;
+        }
+
+        /// <summary>
+        /// Async server-side SELECT projection.
+        /// </summary>
+        public async Task<List<TResult>> SelectAsync<TResult>(Expression<Func<T, TResult>> selector,
+            CancellationToken ct = default)
+        {
+            return await ExecuteSelectAsync(selector, null, ct).ConfigureAwait(false);
+        }
+
+        /// <summary>
+        /// Async server-side SELECT projection with WHERE clause.
+        /// </summary>
+        public async Task<List<TResult>> SelectAsync<TResult>(Expression<Func<T, TResult>> selector,
+            Expression<Func<T, bool>> predicate, CancellationToken ct = default)
+        {
+            return await ExecuteSelectAsync(selector, predicate, ct).ConfigureAwait(false);
         }
 
         #endregion
@@ -493,6 +529,94 @@ namespace LiteSql
                     fullSql += $" LIMIT {take.Value}";
                 else
                     fullSql = fullSql.Replace("SELECT ", $"SELECT TOP {take.Value} ");
+            }
+
+            return (fullSql, ToDp(parameters));
+        }
+
+        #endregion
+
+        #region Private: Select Projection Execution
+
+        private List<TResult> ExecuteSelect<TResult>(Expression<Func<T, TResult>> selector,
+            Expression<Func<T, bool>> predicate)
+        {
+            var mapping = MappingCache.GetMapping<T>();
+            var orderBy = _orderByClauses;
+            var skip = _skip;
+            var take = _take;
+            ResetQueryState();
+
+            var (fullSql, dp) = BuildSelectSql(mapping, selector, predicate, orderBy, skip, take);
+            _context.EnsureConnectionOpen();
+            return _context.Connection.Query<TResult>(fullSql, dp,
+                transaction: _context.Transaction, commandTimeout: _context.CommandTimeout).ToList();
+        }
+
+        private async Task<List<TResult>> ExecuteSelectAsync<TResult>(Expression<Func<T, TResult>> selector,
+            Expression<Func<T, bool>> predicate, CancellationToken ct = default)
+        {
+            var mapping = MappingCache.GetMapping<T>();
+            var orderBy = _orderByClauses;
+            var skip = _skip;
+            var take = _take;
+            ResetQueryState();
+
+            var (fullSql, dp) = BuildSelectSql(mapping, selector, predicate, orderBy, skip, take);
+            await _context.EnsureConnectionOpenAsync(ct).ConfigureAwait(false);
+            var results = (await _context.Connection.QueryAsync<TResult>(
+                new CommandDefinition(fullSql, dp, transaction: _context.Transaction,
+                    commandTimeout: _context.CommandTimeout, cancellationToken: ct)).ConfigureAwait(false)).ToList();
+            return results;
+        }
+
+        private (string sql, DynamicParameters dp) BuildSelectSql<TResult>(
+            EntityMapping mapping, Expression<Func<T, TResult>> selector,
+            Expression<Func<T, bool>> predicate,
+            List<string> orderByClauses, int? skip, int? take)
+        {
+            var selectBuilder = new SelectBuilder(mapping);
+            var columnList = selectBuilder.Build(selector);
+            var tableName = SqlGenerator.QuoteTableName(mapping.TableName);
+
+            IDictionary<string, object> parameters = null;
+            string fullSql;
+            if (predicate != null)
+            {
+                var builder = new WhereBuilder(mapping);
+                var (whereSql, whereParams) = builder.Build(predicate);
+                parameters = whereParams;
+                fullSql = $"SELECT {columnList} FROM {tableName} WHERE {whereSql}";
+            }
+            else
+            {
+                fullSql = $"SELECT {columnList} FROM {tableName}";
+            }
+
+            // ORDER BY
+            if (orderByClauses != null && orderByClauses.Count > 0)
+                fullSql += $" ORDER BY {string.Join(", ", orderByClauses)}";
+
+            // Pagination — reuse same logic as BuildWhereSql
+            var isSqlite = _context.Connection.GetType().Name
+                .IndexOf("sqlite", StringComparison.OrdinalIgnoreCase) >= 0;
+
+            if (skip.HasValue || take.HasValue)
+            {
+                if (isSqlite)
+                {
+                    if (take.HasValue) fullSql += $" LIMIT {take.Value}";
+                    else fullSql += " LIMIT -1";
+                    if (skip.HasValue) fullSql += $" OFFSET {skip.Value}";
+                }
+                else
+                {
+                    if (orderByClauses == null || orderByClauses.Count == 0)
+                        fullSql += " ORDER BY (SELECT NULL)";
+                    fullSql += $" OFFSET {skip ?? 0} ROWS";
+                    if (take.HasValue)
+                        fullSql += $" FETCH NEXT {take.Value} ROWS ONLY";
+                }
             }
 
             return (fullSql, ToDp(parameters));

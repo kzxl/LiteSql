@@ -159,6 +159,104 @@ namespace LiteSql
 
         #endregion
 
+        #region Transaction Helpers (Phase 9)
+
+        /// <summary>
+        /// Executes an action within an auto-managed transaction.
+        /// Commits on success, rolls back on exception.
+        /// </summary>
+        public void ExecuteInTransaction(Action<LiteContext> action)
+        {
+            if (action == null) throw new ArgumentNullException(nameof(action));
+            ThrowIfDisposed();
+            EnsureConnectionOpen();
+            using (var tx = Connection.BeginTransaction())
+            {
+                Transaction = tx;
+                try
+                {
+                    action(this);
+                    tx.Commit();
+                }
+                catch { tx.Rollback(); throw; }
+                finally { Transaction = null; }
+            }
+        }
+
+        /// <summary>
+        /// Executes an async action within an auto-managed transaction.
+        /// Commits on success, rolls back on exception.
+        /// </summary>
+        public async Task ExecuteInTransactionAsync(Func<LiteContext, Task> action, CancellationToken ct = default)
+        {
+            if (action == null) throw new ArgumentNullException(nameof(action));
+            ThrowIfDisposed();
+            await EnsureConnectionOpenAsync(ct).ConfigureAwait(false);
+            using (var tx = Connection.BeginTransaction())
+            {
+                Transaction = tx;
+                try
+                {
+                    await action(this).ConfigureAwait(false);
+                    tx.Commit();
+                }
+                catch { tx.Rollback(); throw; }
+                finally { Transaction = null; }
+            }
+        }
+
+        #endregion
+
+        #region InsertAndGetId (Phase 8.2)
+
+        /// <summary>
+        /// Inserts an entity and immediately returns the generated identity value.
+        /// Does not go through SubmitChanges — executes immediately.
+        /// </summary>
+        public long InsertAndGetId<T>(T entity) where T : class
+        {
+            if (entity == null) throw new ArgumentNullException(nameof(entity));
+            ThrowIfDisposed();
+            EnsureConnectionOpen();
+
+            var mapping = MappingCache.GetMapping<T>();
+            var (sql, parameters) = SqlGenerator.GenerateInsert(mapping, entity);
+            LogSql(sql, parameters);
+            Connection.Execute(sql, (object)ToDynamicParameters(parameters),
+                transaction: Transaction, commandTimeout: CommandTimeout);
+
+            var id = Connection.ExecuteScalar<long>(GetLastInsertIdSql(Connection),
+                transaction: Transaction);
+            SetPkValue(mapping.PrimaryKeys.FirstOrDefault(p => p.IsDbGenerated), entity, id);
+            return id;
+        }
+
+        /// <summary>
+        /// Inserts an entity and immediately returns the generated identity value (async).
+        /// </summary>
+        public async Task<long> InsertAndGetIdAsync<T>(T entity, CancellationToken ct = default) where T : class
+        {
+            if (entity == null) throw new ArgumentNullException(nameof(entity));
+            ThrowIfDisposed();
+            await EnsureConnectionOpenAsync(ct).ConfigureAwait(false);
+
+            var mapping = MappingCache.GetMapping<T>();
+            var (sql, parameters) = SqlGenerator.GenerateInsert(mapping, entity);
+            LogSql(sql, parameters);
+            await Connection.ExecuteAsync(new CommandDefinition(
+                sql, (object)ToDynamicParameters(parameters),
+                transaction: Transaction, commandTimeout: CommandTimeout,
+                cancellationToken: ct)).ConfigureAwait(false);
+
+            var id = await Connection.ExecuteScalarAsync<long>(
+                new CommandDefinition(GetLastInsertIdSql(Connection),
+                    transaction: Transaction, cancellationToken: ct)).ConfigureAwait(false);
+            SetPkValue(mapping.PrimaryKeys.FirstOrDefault(p => p.IsDbGenerated), entity, id);
+            return id;
+        }
+
+        #endregion
+
         #region Change Processing
 
         private void ProcessChanges(IReadOnlyList<TrackedEntity> changes, IDbTransaction tx)
