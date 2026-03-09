@@ -28,7 +28,7 @@
 - 🔌 **Multi-database** — SQL Server and SQLite, extensible to others
 - 📦 **.NET Standard 2.0** — Works on both .NET Framework and .NET Core / .NET 5+
 - 🛠️ **Code Generator** — Generate entities from SQL Server database or `.dbml` files
-- 🧪 **97 tests** — Unit, integration & performance tests with SQLite in-memory
+- 🧪 **111 tests** — Unit, integration & performance tests with SQLite in-memory
 
 ## Packages
 
@@ -202,6 +202,27 @@ var orders = db.Orders
     .OrderByDescending(o => o.OrderDate)
     .Skip(0).Take(20)
     .Where(o => o.Status == "Active");
+```
+
+## Select Projection
+
+Project specific columns at the SQL level (avoids `SELECT *`):
+
+```csharp
+// DTO projection
+var dtos = db.Products
+    .Select(p => new ProductDto { Id = p.Id, Name = p.Name },
+            p => p.IsActive);
+// → SELECT [id] AS [Id], [Name] AS [Name] FROM [Products] WHERE [IsActive] = @w0
+
+// With OrderBy + Pagination
+var page = db.Products
+    .OrderBy(p => p.Name)
+    .Skip(10).Take(5)
+    .Select(p => new ProductDto { Id = p.Id, Name = p.Name });
+
+// Async
+var dtos = await db.Products.SelectAsync(p => new { p.Id, p.Name });
 ```
 
 ## FK Navigation (Auto-Load)
@@ -383,7 +404,10 @@ dotnet tool update --global LiteSql.CodeGen --add-source path/to/LiteSql/nupkg
 | DataLoadOptions | `LoadWith<T>()` |
 | Sorting | `OrderBy()`, `OrderByDescending()`, `ThenBy()`, `ThenByDescending()` |
 | Pagination | `Skip()`, `Take()` |
+| Select Projection | `Select<TResult>()`, `SelectAsync<TResult>()` |
 | Dirty Update | Only changed columns are UPDATEd |
+| Insert + Get ID | `InsertAndGetId<T>()`, `InsertAndGetIdAsync<T>()` |
+| Transaction Helper | `ExecuteInTransaction()`, `ExecuteInTransactionAsync()` |
 | Async queries | `WhereAsync()`, `FirstOrDefaultAsync()`, `CountAsync()`, `AnyAsync()`, `ToListAsync()` |
 | Async submit | `SubmitChangesAsync()` |
 | Async raw SQL | `ExecuteQueryAsync()`, `ExecuteCommandAsync()` |
@@ -429,7 +453,7 @@ Or use the Code Generator to regenerate from your database directly.
 
 ```bash
 dotnet build
-dotnet test   # 97 tests
+dotnet test   # 111 tests
 dotnet pack src/LiteSql/LiteSql.csproj -c Release -o ./nupkg
 dotnet pack src/LiteSql.CodeGen/LiteSql.CodeGen.csproj -c Release -o ./nupkg
 ```
@@ -445,7 +469,7 @@ LiteSql is designed as a **lightweight L2S replacement**, not a full-featured OR
 | **Schema** | Migration | No `Add-Migration` / `Update-Database`. Schema managed externally (SQL scripts, SSMS). CodeGen is DB → Code only |
 | **Performance** | Bulk Insert | No `SqlBulkCopy` wrapper. `InsertOnSubmit` inserts one row at a time |
 | **Performance** | Split Query | No `AsSplitQuery()`. `Include()` uses batch IN queries (good enough for most cases) |
-| **LINQ** | Full LINQ Provider | `Where`, `FirstOrDefault`, `Any`, `Count`, `OrderBy`, `ThenBy`, `Skip`, `Take`. No `Select`, `GroupBy`, `Join` |
+| **LINQ** | Full LINQ Provider | `Where`, `FirstOrDefault`, `Any`, `Count`, `OrderBy`, `ThenBy`, `Skip`, `Take`, `Select`. No `GroupBy`, `Join` |
 | **Transaction** | Transaction Helpers | Has basic `db.Transaction` + auto-transaction in `SubmitChanges`. No `ExecuteInTransaction(action)`, `SavePoint`, or `TransactionScope` |
 | **ORM** | Graph Insert/Update | Cannot insert/update an entire object graph (parent + children) in one call |
 | **ORM** | Collection Navigation | FK navigation is parent-only (many-to-one). No `Order.OrderDetails` (one-to-many) collections |
@@ -474,11 +498,13 @@ LiteSql is designed as a **lightweight L2S replacement**, not a full-featured OR
 - [x] **Phase 5** — Database Schema CodeGen
 - [x] **Phase 6** — FK Navigation, Include API, Performance Tests
 - [x] **Phase 7a** — OrderBy/ThenBy, Skip/Take, Dirty Update, SQL Cache, Compiled Delegates
+- [x] **Phase 7b** — Select Projection (anonymous, DTO, scalar)
+- [x] **Phase 8.2** — InsertAndGetId/InsertAndGetIdAsync
+- [x] **Phase 9** — Transaction Helpers (ExecuteInTransaction/Async)
 
 ### Planned (priority order)
 
-- [ ] **Phase 7b — Extended LINQ (cont.)** ⭐ High Priority
-  - `Select(x => new { ... })` — Projection queries
+- [ ] **Phase 7c — Extended LINQ (cont.)** ⭐ High Priority
   - `Distinct()`, `Max()`, `Min()`, `Sum()`, `Average()` — Aggregates
   - Compiled query cache — Cache expression → SQL for repeated queries
 - [ ] **Phase 8 — Bulk & Batch Operations** ⭐ High Priority
@@ -601,7 +627,7 @@ LiteSql được thiết kế là **thay thế nhẹ cho L2S**, không phải OR
 |---|---|---|
 | **Schema** | Migration | Không có migration. Schema quản lý bằng SQL scripts bên ngoài |
 | **Hiệu năng** | Bulk Insert | Không có `SqlBulkCopy`. Insert từng row |
-| **LINQ** | Full LINQ | Có `Where`, `FirstOrDefault`, `Any`, `Count`, `OrderBy`, `ThenBy`, `Skip`, `Take`. Chưa có `Select`, `GroupBy`, `Join` |
+| **LINQ** | Full LINQ | Có `Where`, `FirstOrDefault`, `Any`, `Count`, `OrderBy`, `ThenBy`, `Skip`, `Take`, `Select`. Chưa có `GroupBy`, `Join` |
 | **Transaction** | Helpers | Có cơ bản. Chưa có `ExecuteInTransaction()` |
 | **ORM** | Graph Object | Không insert/update cả cây object (parent + children) |
 | **ORM** | Collection Nav | FK navigation chỉ 1 chiều (many-to-one). Chưa có `Order.OrderDetails` |
@@ -618,10 +644,11 @@ LiteSql được thiết kế là **thay thế nhẹ cho L2S**, không phải OR
 - [x] **Phase 5** — Database Schema CodeGen
 - [x] **Phase 6** — FK Navigation, Include API, Performance Tests
 - [x] **Phase 7a** — OrderBy/ThenBy, Skip/Take, Dirty Update, SQL Cache, Compiled Delegates
+- [x] **Phase 7b** — Select Projection, InsertAndGetId, Transaction Helpers
 
 ### Dự kiến (theo độ ưu tiên)
 
-- [ ] **Phase 7b — Mở rộng LINQ (tt.)** ⭐ — `Select()`, aggregates, query cache
+- [ ] **Phase 7c — Mở rộng LINQ (tt.)** ⭐ — aggregates, query cache
 - [ ] **Phase 8 — Bulk & Batch** ⭐ — `SqlBulkCopy`, `BulkUpdate`, `BulkDelete`, `InsertAndGetId()`
 - [ ] **Phase 9 — Transaction & Unit of Work** — `ExecuteInTransaction()`, Savepoint, batch submit
 - [ ] **Phase 10 — ChangeTracker & Entity State** — `EntityState`, `Entries<T>()`, `HasChanges()`
