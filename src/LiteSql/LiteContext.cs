@@ -49,6 +49,12 @@ namespace LiteSql
         /// </summary>
         public QueryProfiler Profiler { get; } = new QueryProfiler();
 
+        /// <summary>
+        /// Query execution pipeline interceptor.
+        /// Provides OnBeforeExecute/OnAfterExecute/OnError hooks.
+        /// </summary>
+        public QueryInterceptor Interceptor { get; set; }
+
         #region Constructors
 
         public LiteContext(IDbConnection connection)
@@ -135,6 +141,34 @@ namespace LiteSql
             EnsureConnectionOpen();
             var (sql, dp) = ConvertParams(command, parameters);
             return Connection.Execute(sql, (object)dp, transaction: Transaction, commandTimeout: CommandTimeout);
+        }
+
+        /// <summary>
+        /// Executes raw SQL and maps results to T using named @parameters.
+        /// Unlike ExecuteQuery which uses positional {0} params,
+        /// this accepts an anonymous object for named parameters.
+        /// Example: db.FromSql&lt;Order&gt;("SELECT * FROM Orders WHERE Status = @status", new { status = "Active" })
+        /// </summary>
+        public List<T> FromSql<T>(string sql, object parameters = null)
+        {
+            ThrowIfDisposed();
+            EnsureConnectionOpen();
+            return Connection.Query<T>(sql, parameters,
+                transaction: Transaction, commandTimeout: CommandTimeout).ToList();
+        }
+
+        /// <summary>
+        /// Async version of FromSql.
+        /// </summary>
+        public async Task<List<T>> FromSqlAsync<T>(string sql, object parameters = null,
+            CancellationToken ct = default)
+        {
+            ThrowIfDisposed();
+            await EnsureConnectionOpenAsync(ct).ConfigureAwait(false);
+            return (await Connection.QueryAsync<T>(
+                new CommandDefinition(sql, parameters,
+                    transaction: Transaction, commandTimeout: CommandTimeout,
+                    cancellationToken: ct)).ConfigureAwait(false)).ToList();
         }
 
         #endregion

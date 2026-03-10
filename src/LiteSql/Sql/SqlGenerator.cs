@@ -51,6 +51,7 @@ namespace LiteSql.Sql
 
         /// <summary>
         /// Generates a parameterized DELETE statement using primary key(s).
+        /// If entity has [SoftDelete] attribute, generates UPDATE SET {Column}=1 instead.
         /// </summary>
         public static (string Sql, IDictionary<string, object> Parameters) GenerateDelete(
             EntityMapping mapping, object entity)
@@ -59,11 +60,27 @@ namespace LiteSql.Sql
                 throw new InvalidOperationException(
                     $"Cannot generate DELETE for '{mapping.EntityType.Name}': no primary key defined.");
 
-            var sqlTemplate = _deleteSqlCache.GetOrAdd(mapping.EntityType, _ =>
+            // Check for SoftDelete attribute
+            var softDelete = mapping.EntityType
+                .GetCustomAttributes(typeof(SoftDeleteAttribute), true)
+                .FirstOrDefault() as SoftDeleteAttribute;
+
+            string sqlTemplate;
+            if (softDelete != null)
             {
+                // Soft delete: UPDATE SET {Column} = 1 WHERE PK = @pk
                 var pkClauses = mapping.PrimaryKeys.Select(pk => $"[{pk.ColumnName}] = @pk_{pk.ColumnName}");
-                return $"DELETE FROM {QuoteTableName(mapping.TableName)} WHERE {string.Join(" AND ", pkClauses)}";
-            });
+                sqlTemplate = $"UPDATE {QuoteTableName(mapping.TableName)} SET [{softDelete.ColumnName}] = 1 " +
+                              $"WHERE {string.Join(" AND ", pkClauses)}";
+            }
+            else
+            {
+                sqlTemplate = _deleteSqlCache.GetOrAdd(mapping.EntityType, _ =>
+                {
+                    var pkClauses = mapping.PrimaryKeys.Select(pk => $"[{pk.ColumnName}] = @pk_{pk.ColumnName}");
+                    return $"DELETE FROM {QuoteTableName(mapping.TableName)} WHERE {string.Join(" AND ", pkClauses)}";
+                });
+            }
 
             var parameters = new Dictionary<string, object>();
             foreach (var pk in mapping.PrimaryKeys)

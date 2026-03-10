@@ -23,6 +23,7 @@ namespace LiteSql
         private readonly ChangeTracker _changeTracker;
         private bool _noTracking;
         private bool _ignoreFilters;
+        private string _queryTag;
         private List<string> _orderByClauses;
         private int? _skip;
         private int? _take;
@@ -400,6 +401,16 @@ namespace LiteSql
         }
 
         /// <summary>
+        /// Adds a comment tag to the generated SQL for debugging & profiling.
+        /// The tag appears as /* tag */ before the SQL statement.
+        /// </summary>
+        public Table<T> TagWith(string tag)
+        {
+            _queryTag = tag;
+            return this;
+        }
+
+        /// <summary>
         /// Server-side DELETE without loading entities.
         /// Deletes all rows matching the predicate in a single SQL statement.
         /// </summary>
@@ -563,19 +574,63 @@ namespace LiteSql
         }
 
         /// <summary>
-        /// Async server-side COUNT.
+        /// Async FirstOrDefault without predicate. Returns first row or null.
+        /// </summary>
+        public async Task<T> FirstOrDefaultAsync(CancellationToken ct = default)
+        {
+            if (_take == null) _take = 1;
+            var results = await ExecuteWhereAsync(null, ct: ct).ConfigureAwait(false);
+            return results.FirstOrDefault();
+        }
+
+        /// <summary>
+        /// Async server-side COUNT with predicate. Respects global query filters.
         /// </summary>
         public async Task<int> CountAsync(Expression<Func<T, bool>> predicate, CancellationToken ct = default)
         {
             var mapping = MappingCache.GetMapping<T>();
+            var tableName = SqlGenerator.QuoteTableName(mapping.TableName);
+            var whereParts = new List<string>();
+            IDictionary<string, object> allParams = new Dictionary<string, object>();
+
+            // Inject global filters
+            if (!_ignoreFilters && _context.Filters.HasFilters)
+            {
+                var filters = _context.Filters.GetFilters(typeof(T));
+                if (filters.Count > 0)
+                {
+                    var filterBuilder = new WhereBuilder(mapping);
+                    foreach (var filter in filters)
+                    {
+                        var (fSql, fParams) = filterBuilder.BuildFromLambda(filter);
+                        whereParts.Add(fSql);
+                        if (fParams != null)
+                            foreach (var kv in fParams) allParams[kv.Key] = kv.Value;
+                    }
+                }
+            }
+
             var builder = new WhereBuilder(mapping);
             var (whereSql, parameters) = builder.Build(predicate);
-            var sql = $"SELECT COUNT(*) FROM [{mapping.TableName}] WHERE {whereSql}";
+            whereParts.Add("(" + whereSql + ")");
+            if (parameters != null)
+                foreach (var kv in parameters) allParams[kv.Key] = kv.Value;
+
+            var sql = $"SELECT COUNT(*) FROM {tableName} WHERE {string.Join(" AND ", whereParts)}";
             await _context.EnsureConnectionOpenAsync(ct).ConfigureAwait(false);
             return await _context.Connection.ExecuteScalarAsync<int>(
-                new CommandDefinition(sql, ToDp(parameters),
+                new CommandDefinition(sql, ToDp(allParams),
                     transaction: _context.Transaction, commandTimeout: _context.CommandTimeout,
                     cancellationToken: ct)).ConfigureAwait(false);
+        }
+
+        /// <summary>
+        /// Async server-side COUNT without predicate. Returns total row count.
+        /// Respects global query filters.
+        /// </summary>
+        public async Task<int> CountAsync(CancellationToken ct = default)
+        {
+            return await CountAsync(x => true, ct).ConfigureAwait(false);
         }
 
         /// <summary>
@@ -584,6 +639,14 @@ namespace LiteSql
         public async Task<bool> AnyAsync(Expression<Func<T, bool>> predicate, CancellationToken ct = default)
         {
             return await CountAsync(predicate, ct).ConfigureAwait(false) > 0;
+        }
+
+        /// <summary>
+        /// Async server-side existence check without predicate.
+        /// </summary>
+        public async Task<bool> AnyAsync(CancellationToken ct = default)
+        {
+            return await CountAsync(x => true, ct).ConfigureAwait(false) > 0;
         }
 
         /// <summary>
@@ -877,6 +940,10 @@ namespace LiteSql
                 else
                     fullSql = fullSql.Replace("SELECT ", $"SELECT TOP {take.Value} ");
             }
+
+            // Query tag for debugging
+            if (_queryTag != null)
+                fullSql = $"/* {_queryTag} */ {fullSql}";
 
             return (fullSql, ToDp(parameters));
         }
