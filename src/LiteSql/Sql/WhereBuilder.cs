@@ -284,24 +284,40 @@ namespace LiteSql.Sql
             // Try fast path for common closure pattern: () => someLocal
             if (expression is MemberExpression member)
             {
-                if (member.Expression is ConstantExpression closureConstant)
-                {
-                    var field = member.Member as FieldInfo;
-                    if (field != null)
-                        return field.GetValue(closureConstant.Value);
+                // Handle nested member access: closure.field.property
+                object target = null;
+                if (member.Expression != null)
+                    target = EvaluateExpression(member.Expression);
 
-                    var prop = member.Member as PropertyInfo;
-                    if (prop != null)
-                        return prop.GetValue(closureConstant.Value);
-                }
+                var field = member.Member as FieldInfo;
+                if (field != null)
+                    return field.GetValue(target);
+
+                var prop = member.Member as PropertyInfo;
+                if (prop != null)
+                    return prop.GetValue(target);
             }
 
             if (expression is ConstantExpression constant)
                 return constant.Value;
 
+            // Handle inline array creation: new[] { 1, 2, 3 }
+            if (expression is NewArrayExpression newArray)
+            {
+                var items = new List<object>();
+                foreach (var elem in newArray.Expressions)
+                    items.Add(EvaluateExpression(elem));
+                return items;
+            }
+
+            // Handle conversions (e.g., implicit casts)
+            if (expression is UnaryExpression unary && unary.NodeType == ExpressionType.Convert)
+                return EvaluateExpression(unary.Operand);
+
             // Fallback: compile and invoke
             var lambda = Expression.Lambda(expression);
-            return lambda.Compile().DynamicInvoke();
+            var fn = lambda.Compile();
+            return fn.DynamicInvoke();
         }
     }
 }

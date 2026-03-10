@@ -55,6 +55,12 @@ namespace LiteSql
         /// </summary>
         public QueryInterceptor Interceptor { get; set; }
 
+        /// <summary>
+        /// Value converter registry.
+        /// Converts model types ⇄ database types (e.g., Enum ↔ string, object ↔ JSON).
+        /// </summary>
+        public ValueConverterCollection Converters { get; } = new ValueConverterCollection();
+
         #region Constructors
 
         public LiteContext(IDbConnection connection)
@@ -544,6 +550,7 @@ namespace LiteSql
             Func<EntityMapping, object, (string, IDictionary<string, object>)> generator)
         {
             var (sql, parameters) = generator(mapping, entity);
+            ApplyConverters(parameters, mapping);
             LogSql(sql, parameters);
             Connection.Execute(sql, (object)ToDynamicParameters(parameters),
                 transaction: tx, commandTimeout: CommandTimeout);
@@ -553,6 +560,7 @@ namespace LiteSql
             Func<EntityMapping, object, (string, IDictionary<string, object>)> generator, CancellationToken ct)
         {
             var (sql, parameters) = generator(mapping, entity);
+            ApplyConverters(parameters, mapping);
             LogSql(sql, parameters);
             await Connection.ExecuteAsync(new CommandDefinition(
                 sql, (object)ToDynamicParameters(parameters),
@@ -621,6 +629,28 @@ namespace LiteSql
             if (parameters != null)
                 foreach (var kv in parameters) dp.Add(kv.Key, kv.Value);
             return dp;
+        }
+
+        /// <summary>
+        /// Applies registered value converters to parameter values.
+        /// Converts model types to database types (e.g., Enum → string).
+        /// </summary>
+        private void ApplyConverters(IDictionary<string, object> parameters, EntityMapping mapping)
+        {
+            if (parameters == null || !Converters.HasAny) return;
+
+            var keys = new List<string>(parameters.Keys);
+            foreach (var key in keys)
+            {
+                var value = parameters[key];
+                if (value == null) continue;
+
+                var valueType = value.GetType();
+                if (Converters.HasConverter(valueType))
+                {
+                    parameters[key] = Converters.ConvertToDb(value, valueType);
+                }
+            }
         }
 
         internal void EnsureConnectionOpen()
