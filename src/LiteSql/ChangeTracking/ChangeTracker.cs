@@ -178,6 +178,72 @@ namespace LiteSql.ChangeTracking
         {
             _trackedEntities.AddRange(updates);
         }
+
+        #region ChangeTracker API (Phase 12)
+
+        /// <summary>
+        /// Gets the tracked state of an entity.
+        /// Returns Unchanged if the entity is tracked (loaded) but not modified.
+        /// Throws if the entity is not tracked.
+        /// </summary>
+        public EntityState GetState(object entity)
+        {
+            if (entity == null) throw new ArgumentNullException(nameof(entity));
+
+            // Check pending changes first
+            var tracked = _trackedEntities.FirstOrDefault(e => ReferenceEquals(e.Entity, entity));
+            if (tracked != null) return tracked.State;
+
+            // If in original values but not in pending changes, it's unchanged
+            if (_originalValues.ContainsKey(entity)) return EntityState.Unchanged;
+
+            throw new InvalidOperationException(
+                $"Entity of type '{entity.GetType().Name}' is not tracked by this ChangeTracker.");
+        }
+
+        /// <summary>
+        /// Returns all tracked entities of type T with their current state.
+        /// Includes entities in Insert, Update, Delete, and Unchanged states.
+        /// </summary>
+        public IReadOnlyList<TrackedEntry<T>> Entries<T>() where T : class
+        {
+            var result = new List<TrackedEntry<T>>();
+
+            // Add pending changes
+            foreach (var tracked in _trackedEntities)
+            {
+                if (tracked.Entity is T typedEntity)
+                {
+                    result.Add(new TrackedEntry<T>(typedEntity, tracked.State));
+                }
+            }
+
+            // Add unchanged (loaded but not in pending changes)
+            var pendingEntities = new HashSet<object>(
+                _trackedEntities.Select(t => t.Entity), ReferenceEqualityComparer.Instance);
+
+            foreach (var entity in _originalValues.Keys)
+            {
+                if (entity is T typedUnchanged && !pendingEntities.Contains(entity))
+                {
+                    result.Add(new TrackedEntry<T>(typedUnchanged, EntityState.Unchanged));
+                }
+            }
+
+            return result.AsReadOnly();
+        }
+
+        /// <summary>
+        /// Returns true if an entity is being tracked.
+        /// </summary>
+        public bool IsTracking(object entity)
+        {
+            if (entity == null) return false;
+            return _originalValues.ContainsKey(entity) ||
+                   _trackedEntities.Any(e => ReferenceEquals(e.Entity, entity));
+        }
+
+        #endregion
     }
 
     /// <summary>

@@ -27,6 +27,17 @@ namespace LiteSql
         private readonly ChangeTracker _changeTracker = new ChangeTracker();
         private bool _disposed;
 
+        /// <summary>
+        /// Provides lifecycle hooks for entity save operations.
+        /// Register OnBeforeSave/OnAfterSave handlers per entity type.
+        /// </summary>
+        public SaveHooks Hooks { get; } = new SaveHooks();
+
+        /// <summary>
+        /// Exposes ChangeTracker API for querying entity states.
+        /// </summary>
+        public ChangeTracker ChangeTracker => _changeTracker;
+
         #region Constructors
 
         public LiteContext(IDbConnection connection)
@@ -380,6 +391,8 @@ namespace LiteSql
             foreach (var tracked in changes)
             {
                 var mapping = MappingCache.GetMapping(tracked.EntityType);
+                Hooks.InvokeBeforeSave(tracked.Entity, tracked.EntityType, tracked.State);
+
                 switch (tracked.State)
                 {
                     case EntityState.Insert:
@@ -407,6 +420,8 @@ namespace LiteSql
                         ExecuteCrud(mapping, tracked.Entity, tx, SqlGenerator.GenerateDelete);
                         break;
                 }
+
+                Hooks.InvokeAfterSave(tracked.Entity, tracked.EntityType, tracked.State);
             }
         }
 
