@@ -17,6 +17,9 @@ namespace LiteSql.Mapping
         public bool IsDbGenerated { get; set; }
         public bool CanBeNull { get; set; }
         public AutoSync AutoSync { get; set; }
+
+        /// <summary>True if this column is a version/timestamp for optimistic concurrency.</summary>
+        public bool IsVersion { get; set; }
     }
 
     /// <summary>
@@ -112,7 +115,8 @@ namespace LiteSql.Mapping
                         IsPrimaryKey = colAttr.IsPrimaryKey,
                         IsDbGenerated = colAttr.IsDbGenerated,
                         CanBeNull = colAttr.CanBeNull,
-                        AutoSync = colAttr.AutoSync
+                        AutoSync = colAttr.AutoSync,
+                        IsVersion = colAttr.IsVersion
                     });
                 }
             }

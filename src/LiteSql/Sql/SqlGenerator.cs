@@ -188,6 +188,55 @@ namespace LiteSql.Sql
             return parameters;
         }
 
+        /// <summary>
+        /// Generates an UPSERT (INSERT OR UPDATE) SQL statement.
+        /// SQLite: INSERT OR REPLACE INTO ...
+        /// SQL Server: MERGE ... WHEN MATCHED THEN UPDATE WHEN NOT MATCHED THEN INSERT
+        /// </summary>
+        public static (string sql, IDictionary<string, object> parameters)? GenerateUpsert(
+            EntityMapping mapping, object entity, bool isSqlite = true)
+        {
+            if (mapping.PrimaryKeys.Count == 0) return null;
+
+            var allCols = mapping.Columns.Where(c => !c.IsDbGenerated).ToList();
+            var parameters = BuildParameters(allCols, entity);
+
+            // Also add PK params for MERGE ON clause
+            foreach (var pk in mapping.PrimaryKeys)
+            {
+                var pkParam = $"@pk_{pk.ColumnName}";
+                if (!parameters.ContainsKey(pkParam))
+                    parameters[pkParam] = pk.Property.GetValue(entity);
+            }
+
+            if (isSqlite)
+            {
+                // SQLite: INSERT OR REPLACE INTO table (cols) VALUES (vals)
+                var columnNames = allCols.Select(c => $"[{c.ColumnName}]");
+                var paramNames = allCols.Select(c => $"@{c.ColumnName}");
+                var sql = $"INSERT OR REPLACE INTO {QuoteTableName(mapping.TableName)} " +
+                          $"({string.Join(", ", columnNames)}) VALUES ({string.Join(", ", paramNames)})";
+                return (sql, parameters);
+            }
+            else
+            {
+                // SQL Server: MERGE
+                var onClause = string.Join(" AND ",
+                    mapping.PrimaryKeys.Select(pk => $"T.[{pk.ColumnName}] = S.[{pk.ColumnName}]"));
+                var updateCols = allCols.Where(c => !c.IsPrimaryKey).ToList();
+                var setClauses = updateCols.Select(c => $"T.[{c.ColumnName}] = @{c.ColumnName}");
+                var insertCols = allCols.Select(c => $"[{c.ColumnName}]");
+                var insertVals = allCols.Select(c => $"@{c.ColumnName}");
+
+                var sql = $"MERGE {QuoteTableName(mapping.TableName)} AS T " +
+                          $"USING (SELECT {string.Join(", ", mapping.PrimaryKeys.Select(pk => $"@pk_{pk.ColumnName} AS [{pk.ColumnName}]"))}) AS S " +
+                          $"ON {onClause} " +
+                          $"WHEN MATCHED THEN UPDATE SET {string.Join(", ", setClauses)} " +
+                          $"WHEN NOT MATCHED THEN INSERT ({string.Join(", ", insertCols)}) VALUES ({string.Join(", ", insertVals)});";
+                return (sql, parameters);
+            }
+        }
+
         #endregion
 
         /// <summary>

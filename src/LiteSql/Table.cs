@@ -22,6 +22,7 @@ namespace LiteSql
         private readonly LiteContext _context;
         private readonly ChangeTracker _changeTracker;
         private bool _noTracking;
+        private bool _ignoreFilters;
         private List<string> _orderByClauses;
         private int? _skip;
         private int? _take;
@@ -231,16 +232,41 @@ namespace LiteSql
         }
 
         /// <summary>
-        /// Server-side COUNT matching predicate.
+        /// Server-side COUNT matching predicate. Respects global query filters.
         /// </summary>
         public int Count(Expression<Func<T, bool>> predicate)
         {
             var mapping = MappingCache.GetMapping<T>();
+            var tableName = SqlGenerator.QuoteTableName(mapping.TableName);
+            var whereParts = new List<string>();
+            IDictionary<string, object> allParams = new Dictionary<string, object>();
+
+            // Inject global filters
+            if (!_ignoreFilters && _context.Filters.HasFilters)
+            {
+                var filters = _context.Filters.GetFilters(typeof(T));
+                if (filters.Count > 0)
+                {
+                    var filterBuilder = new WhereBuilder(mapping);
+                    foreach (var filter in filters)
+                    {
+                        var (fSql, fParams) = filterBuilder.BuildFromLambda(filter);
+                        whereParts.Add(fSql);
+                        if (fParams != null)
+                            foreach (var kv in fParams) allParams[kv.Key] = kv.Value;
+                    }
+                }
+            }
+
             var builder = new WhereBuilder(mapping);
             var (whereSql, parameters) = builder.Build(predicate);
-            var sql = $"SELECT COUNT(*) FROM [{mapping.TableName}] WHERE {whereSql}";
+            whereParts.Add("(" + whereSql + ")");
+            if (parameters != null)
+                foreach (var kv in parameters) allParams[kv.Key] = kv.Value;
+
+            var sql = $"SELECT COUNT(*) FROM {tableName} WHERE {string.Join(" AND ", whereParts)}";
             _context.EnsureConnectionOpen();
-            return _context.Connection.ExecuteScalar<int>(sql, ToDp(parameters),
+            return _context.Connection.ExecuteScalar<int>(sql, ToDp(allParams),
                 transaction: _context.Transaction, commandTimeout: _context.CommandTimeout);
         }
 
@@ -303,7 +329,190 @@ namespace LiteSql
                 transaction: _context.Transaction, commandTimeout: _context.CommandTimeout).ToList();
         }
 
+        /// <summary>
+        /// Server-side pagination. Returns a PagedResult with Items, TotalCount, TotalPages.
+        /// Executes 2 queries: COUNT + paginated SELECT.
+        /// Requires OrderBy to be set (for deterministic paging).
+        /// </summary>
+        public PagedResult<T> ToPagedResult(int page, int pageSize,
+            Expression<Func<T, bool>> predicate = null)
+        {
+            if (page < 1) throw new ArgumentOutOfRangeException(nameof(page), "Page must be >= 1");
+            if (pageSize < 1) throw new ArgumentOutOfRangeException(nameof(pageSize), "PageSize must be >= 1");
+
+            var totalCount = Count(predicate ?? (x => true));
+
+            _skip = (page - 1) * pageSize;
+            _take = pageSize;
+            var items = predicate != null ? ExecuteWhere(predicate) : ExecuteWhere(null);
+
+            var totalPages = totalCount == 0 ? 0 : (int)Math.Ceiling((double)totalCount / pageSize);
+
+            return new PagedResult<T>
+            {
+                Items = items,
+                TotalCount = totalCount,
+                TotalPages = totalPages,
+                CurrentPage = page,
+                PageSize = pageSize
+            };
+        }
+
+        /// <summary>
+        /// Async server-side pagination.
+        /// </summary>
+        public async Task<PagedResult<T>> ToPagedResultAsync(int page, int pageSize,
+            Expression<Func<T, bool>> predicate = null, CancellationToken ct = default)
+        {
+            if (page < 1) throw new ArgumentOutOfRangeException(nameof(page), "Page must be >= 1");
+            if (pageSize < 1) throw new ArgumentOutOfRangeException(nameof(pageSize), "PageSize must be >= 1");
+
+            var totalCount = await CountAsync(predicate ?? (x => true), ct).ConfigureAwait(false);
+
+            _skip = (page - 1) * pageSize;
+            _take = pageSize;
+            var items = predicate != null
+                ? await ExecuteWhereAsync(predicate, ct: ct).ConfigureAwait(false)
+                : await ExecuteWhereAsync(null, ct: ct).ConfigureAwait(false);
+
+            var totalPages = totalCount == 0 ? 0 : (int)Math.Ceiling((double)totalCount / pageSize);
+
+            return new PagedResult<T>
+            {
+                Items = items,
+                TotalCount = totalCount,
+                TotalPages = totalPages,
+                CurrentPage = page,
+                PageSize = pageSize
+            };
+        }
+
         public IQueryable<T> AsQueryable() => GetAll().AsQueryable();
+
+        /// <summary>
+        /// Disables global query filters for this query.
+        /// Allows bypassing soft-delete or multi-tenant filters.
+        /// </summary>
+        public Table<T> IgnoreFilters()
+        {
+            _ignoreFilters = true;
+            return this;
+        }
+
+        /// <summary>
+        /// Server-side DELETE without loading entities.
+        /// Deletes all rows matching the predicate in a single SQL statement.
+        /// </summary>
+        public int BatchDelete(Expression<Func<T, bool>> predicate)
+        {
+            var mapping = MappingCache.GetMapping<T>();
+            var tableName = SqlGenerator.QuoteTableName(mapping.TableName);
+            var builder = new WhereBuilder(mapping);
+            var (whereSql, whereParams) = builder.Build(predicate);
+            var sql = $"DELETE FROM {tableName} WHERE {whereSql}";
+            _context.EnsureConnectionOpen();
+            return _context.Connection.Execute(sql, (object)ToDp(whereParams),
+                transaction: _context.Transaction, commandTimeout: _context.CommandTimeout);
+        }
+
+        /// <summary>
+        /// Async server-side DELETE without loading entities.
+        /// </summary>
+        public async Task<int> BatchDeleteAsync(Expression<Func<T, bool>> predicate,
+            CancellationToken ct = default)
+        {
+            var mapping = MappingCache.GetMapping<T>();
+            var tableName = SqlGenerator.QuoteTableName(mapping.TableName);
+            var builder = new WhereBuilder(mapping);
+            var (whereSql, whereParams) = builder.Build(predicate);
+            var sql = $"DELETE FROM {tableName} WHERE {whereSql}";
+            await _context.EnsureConnectionOpenAsync(ct).ConfigureAwait(false);
+            return await _context.Connection.ExecuteAsync(
+                new CommandDefinition(sql, ToDp(whereParams),
+                    transaction: _context.Transaction,
+                    commandTimeout: _context.CommandTimeout,
+                    cancellationToken: ct)).ConfigureAwait(false);
+        }
+
+        /// <summary>
+        /// Server-side UPDATE without loading entities.
+        /// Sets columns to the values specified in the setter expression.
+        /// Example: table.BatchUpdate(x => x.Status == "Active", x => new Product { Price = 100 })
+        /// </summary>
+        public int BatchUpdate(Expression<Func<T, bool>> predicate,
+            Expression<Func<T, T>> setter)
+        {
+            var mapping = MappingCache.GetMapping<T>();
+            var tableName = SqlGenerator.QuoteTableName(mapping.TableName);
+            var builder = new WhereBuilder(mapping);
+            var (whereSql, whereParams) = builder.Build(predicate);
+            var (setClauses, setParams) = BuildSetClauses(setter, mapping);
+
+            var sql = $"UPDATE {tableName} SET {setClauses} WHERE {whereSql}";
+            var allParams = whereParams ?? new Dictionary<string, object>();
+            if (setParams != null)
+                foreach (var kv in setParams)
+                    allParams[kv.Key] = kv.Value;
+            _context.EnsureConnectionOpen();
+            return _context.Connection.Execute(sql, (object)ToDp(allParams),
+                transaction: _context.Transaction, commandTimeout: _context.CommandTimeout);
+        }
+
+        /// <summary>
+        /// Async server-side UPDATE without loading entities.
+        /// </summary>
+        public async Task<int> BatchUpdateAsync(Expression<Func<T, bool>> predicate,
+            Expression<Func<T, T>> setter, CancellationToken ct = default)
+        {
+            var mapping = MappingCache.GetMapping<T>();
+            var tableName = SqlGenerator.QuoteTableName(mapping.TableName);
+            var builder = new WhereBuilder(mapping);
+            var (whereSql, whereParams) = builder.Build(predicate);
+            var (setClauses, setParams) = BuildSetClauses(setter, mapping);
+
+            var sql = $"UPDATE {tableName} SET {setClauses} WHERE {whereSql}";
+            var allParams = whereParams ?? new Dictionary<string, object>();
+            if (setParams != null)
+                foreach (var kv in setParams)
+                    allParams[kv.Key] = kv.Value;
+            await _context.EnsureConnectionOpenAsync(ct).ConfigureAwait(false);
+            return await _context.Connection.ExecuteAsync(
+                new CommandDefinition(sql, ToDp(allParams),
+                    transaction: _context.Transaction,
+                    commandTimeout: _context.CommandTimeout,
+                    cancellationToken: ct)).ConfigureAwait(false);
+        }
+
+        /// <summary>
+        /// Extracts SET clauses from a MemberInit expression like x => new T { Prop = value }.
+        /// </summary>
+        private (string setClauses, IDictionary<string, object> parameters) BuildSetClauses(
+            Expression<Func<T, T>> setter, EntityMapping mapping)
+        {
+            if (!(setter.Body is MemberInitExpression init))
+                throw new ArgumentException("Setter must be a MemberInitExpression (x => new T { ... })");
+
+            var clauses = new List<string>();
+            var parameters = new Dictionary<string, object>();
+            int idx = 0;
+
+            foreach (var binding in init.Bindings)
+            {
+                if (binding is MemberAssignment assign)
+                {
+                    var propName = assign.Member.Name;
+                    var col = mapping.Columns.FirstOrDefault(c => c.Property.Name == propName);
+                    if (col == null) continue;
+
+                    var value = Expression.Lambda(assign.Expression).Compile().DynamicInvoke();
+                    var paramName = $"@s{idx++}";
+                    clauses.Add($"[{col.ColumnName}] = {paramName}");
+                    parameters[paramName] = value;
+                }
+            }
+
+            return (string.Join(", ", clauses), parameters);
+        }
 
         /// <summary>
         /// Server-side SELECT projection. Translates expression into SQL column list.
@@ -415,6 +624,13 @@ namespace LiteSql
         {
             if (_orderByClauses != null || _skip.HasValue || _take.HasValue)
                 return await ExecuteWhereAsync(null, ct: ct).ConfigureAwait(false);
+
+            // If global filters are active, go through BuildWhereSql path
+            if (!_ignoreFilters && _context.Filters.HasFilters
+                && _context.Filters.GetFilters(typeof(T)).Count > 0)
+            {
+                return await ExecuteWhereAsync(null, ct: ct).ConfigureAwait(false);
+            }
 
             await _context.EnsureConnectionOpenAsync(ct).ConfigureAwait(false);
             var mapping = MappingCache.GetMapping<T>();
@@ -561,17 +777,62 @@ namespace LiteSql
             var selectAll = SqlGenerator.GenerateSelectAll(mapping);
             IDictionary<string, object> parameters = null;
 
+            // Combine global filters with user predicate
+            var filterClauses = new List<string>();
+            IDictionary<string, object> filterParams = null;
+
+            if (!_ignoreFilters && _context.Filters.HasFilters)
+            {
+                var filters = _context.Filters.GetFilters(typeof(T));
+                if (filters.Count > 0)
+                {
+                    var filterBuilder = new WhereBuilder(mapping);
+                    var allFilterParams = new Dictionary<string, object>();
+                    foreach (var filter in filters)
+                    {
+                        var (fSql, fParams) = filterBuilder.BuildFromLambda(filter);
+                        filterClauses.Add(fSql);
+                        if (fParams != null)
+                        {
+                            foreach (var kv in fParams)
+                                allFilterParams[kv.Key] = kv.Value;
+                        }
+                    }
+                    if (allFilterParams.Count > 0)
+                        filterParams = allFilterParams;
+                }
+            }
+
             string fullSql;
             if (predicate != null)
             {
                 var builder = new WhereBuilder(mapping);
                 var (whereSql, whereParams) = builder.Build(predicate);
                 parameters = whereParams;
-                fullSql = $"{selectAll} WHERE {whereSql}";
+
+                if (filterClauses.Count > 0)
+                {
+                    // Combine: (global filters) AND (user where)
+                    var combined = string.Join(" AND ", filterClauses) + " AND (" + whereSql + ")";
+                    fullSql = $"{selectAll} WHERE {combined}";
+                    MergeParams(ref parameters, filterParams);
+                }
+                else
+                {
+                    fullSql = $"{selectAll} WHERE {whereSql}";
+                }
             }
             else
             {
-                fullSql = selectAll;
+                if (filterClauses.Count > 0)
+                {
+                    fullSql = $"{selectAll} WHERE {string.Join(" AND ", filterClauses)}";
+                    parameters = filterParams;
+                }
+                else
+                {
+                    fullSql = selectAll;
+                }
             }
 
             // ORDER BY
@@ -719,19 +980,44 @@ namespace LiteSql
             var columnName = ExtractColumnNameFromLambda(selector, mapping);
             var tableName = SqlGenerator.QuoteTableName(mapping.TableName);
 
-            string sql;
+            var whereParts = new List<string>();
             IDictionary<string, object> parameters = null;
+
+            // Inject global filters
+            if (!_ignoreFilters && _context.Filters.HasFilters)
+            {
+                var filters = _context.Filters.GetFilters(typeof(T));
+                if (filters.Count > 0)
+                {
+                    var filterBuilder = new WhereBuilder(mapping);
+                    parameters = new Dictionary<string, object>();
+                    foreach (var filter in filters)
+                    {
+                        var (fSql, fParams) = filterBuilder.BuildFromLambda(filter);
+                        whereParts.Add(fSql);
+                        if (fParams != null)
+                            foreach (var kv in fParams)
+                                parameters[kv.Key] = kv.Value;
+                    }
+                }
+            }
+
             if (predicate != null)
             {
                 var builder = new WhereBuilder(mapping);
                 var (whereSql, whereParams) = builder.Build(predicate);
-                parameters = whereParams;
-                sql = $"SELECT {function}([{columnName}]) FROM {tableName} WHERE {whereSql}";
+                whereParts.Add("(" + whereSql + ")");
+                if (parameters == null) parameters = whereParams;
+                else if (whereParams != null)
+                    foreach (var kv in whereParams)
+                        parameters[kv.Key] = kv.Value;
             }
+
+            string sql;
+            if (whereParts.Count > 0)
+                sql = $"SELECT {function}([{columnName}]) FROM {tableName} WHERE {string.Join(" AND ", whereParts)}";
             else
-            {
                 sql = $"SELECT {function}([{columnName}]) FROM {tableName}";
-            }
 
             _context.EnsureConnectionOpen();
             return _context.Connection.ExecuteScalar<TResult>(sql, ToDp(parameters),
@@ -783,6 +1069,13 @@ namespace LiteSql
 
         private List<T> GetAll()
         {
+            // If global filters are active, go through BuildWhereSql path
+            if (!_ignoreFilters && _context.Filters.HasFilters
+                && _context.Filters.GetFilters(typeof(T)).Count > 0)
+            {
+                return ExecuteWhere(null);
+            }
+
             var mapping = MappingCache.GetMapping<T>();
             var results = _context.ExecuteQuery<T>(SqlGenerator.GenerateSelectAll(mapping)).ToList();
             TrackResults(results, mapping);
@@ -809,6 +1102,15 @@ namespace LiteSql
             if (parameters != null)
                 foreach (var kv in parameters) dp.Add(kv.Key, kv.Value);
             return dp;
+        }
+
+        private static void MergeParams(ref IDictionary<string, object> target,
+            IDictionary<string, object> source)
+        {
+            if (source == null) return;
+            if (target == null) { target = source; return; }
+            foreach (var kv in source)
+                target[kv.Key] = kv.Value;
         }
 
         /// <summary>

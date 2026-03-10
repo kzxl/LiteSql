@@ -38,6 +38,17 @@ namespace LiteSql
         /// </summary>
         public ChangeTracker ChangeTracker => _changeTracker;
 
+        /// <summary>
+        /// Global query filters applied automatically to all queries.
+        /// Register per-type predicates (e.g., soft delete, multi-tenant).
+        /// </summary>
+        public QueryFilterCollection Filters { get; } = new QueryFilterCollection();
+
+        /// <summary>
+        /// Query profiler for monitoring execution times and detecting slow queries.
+        /// </summary>
+        public QueryProfiler Profiler { get; } = new QueryProfiler();
+
         #region Constructors
 
         public LiteContext(IDbConnection connection)
@@ -365,6 +376,39 @@ namespace LiteSql
             }
             catch { if (ownTx) tx.Rollback(); throw; }
             finally { if (ownTx) tx.Dispose(); }
+        }
+
+        /// <summary>
+        /// Inserts or updates an entity based on primary key existence.
+        /// SQLite: INSERT OR REPLACE. SQL Server: MERGE.
+        /// </summary>
+        public void Upsert<T>(T entity) where T : class
+        {
+            ThrowIfDisposed();
+            var mapping = MappingCache.GetMapping<T>();
+            var sql = SqlGenerator.GenerateUpsert(mapping, entity);
+            if (sql == null) throw new InvalidOperationException("Upsert requires at least one primary key column.");
+
+            EnsureConnectionOpen();
+            Connection.Execute(sql.Value.sql, (object)ToDynamicParameters(sql.Value.parameters),
+                transaction: Transaction, commandTimeout: CommandTimeout);
+        }
+
+        /// <summary>
+        /// Async version of Upsert.
+        /// </summary>
+        public async Task UpsertAsync<T>(T entity, CancellationToken ct = default) where T : class
+        {
+            ThrowIfDisposed();
+            var mapping = MappingCache.GetMapping<T>();
+            var sql = SqlGenerator.GenerateUpsert(mapping, entity);
+            if (sql == null) throw new InvalidOperationException("Upsert requires at least one primary key column.");
+
+            await EnsureConnectionOpenAsync(ct).ConfigureAwait(false);
+            await Connection.ExecuteAsync(new CommandDefinition(
+                sql.Value.sql, ToDynamicParameters(sql.Value.parameters),
+                transaction: Transaction, commandTimeout: CommandTimeout,
+                cancellationToken: ct)).ConfigureAwait(false);
         }
 
         private static IEnumerable<List<T>> Batch<T>(IEnumerable<T> source, int size)

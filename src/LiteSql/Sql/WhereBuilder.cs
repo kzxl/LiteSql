@@ -26,8 +26,9 @@ namespace LiteSql.Sql
     public class WhereBuilder
     {
         private readonly EntityMapping _mapping;
-        private readonly Dictionary<string, object> _parameters = new Dictionary<string, object>();
+        private readonly IDictionary<string, object> _parameters = new Dictionary<string, object>();
         private int _paramIndex;
+        private string _paramPrefix = "w";
 
         public WhereBuilder(EntityMapping mapping)
         {
@@ -46,6 +47,22 @@ namespace LiteSql.Sql
 
             var sql = Visit(predicate.Body);
             return (sql, _parameters);
+        }
+
+        /// <summary>
+        /// Translates a non-generic LambdaExpression into SQL WHERE clause.
+        /// Used by global query filters.
+        /// </summary>
+        public (string Sql, IDictionary<string, object> Parameters) BuildFromLambda(
+            LambdaExpression predicate)
+        {
+            // Use @f prefix for filter params to avoid collision with @w user params
+            // Don't reset _paramIndex — allows multiple sequential calls to produce unique names
+            _paramPrefix = "f";
+
+            var sql = Visit(predicate.Body);
+            _paramPrefix = "w"; // Reset for next use
+            return (sql, _parameters.Count > 0 ? new Dictionary<string, object>(_parameters) : null);
         }
 
         private string Visit(Expression expression)
@@ -254,7 +271,7 @@ namespace LiteSql.Sql
 
         private string AddParameter(object value)
         {
-            var paramName = $"@w{_paramIndex++}";
+            var paramName = $"@{_paramPrefix}{_paramIndex++}";
             _parameters[paramName] = value;
             return paramName;
         }
