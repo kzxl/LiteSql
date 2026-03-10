@@ -53,6 +53,12 @@ namespace LiteSql.Mapping
         public IReadOnlyList<ColumnMapping> InsertableColumns { get; set; }
         public IReadOnlyList<ColumnMapping> UpdatableColumns { get; set; }
         public IReadOnlyList<AssociationMapping> Associations { get; set; }
+
+        /// <summary>
+        /// One-to-many collection navigation (IsForeignKey=false).
+        /// The OtherType is the child element type, ThisKey is PK on parent, OtherKey is FK on child.
+        /// </summary>
+        public IReadOnlyList<AssociationMapping> CollectionAssociations { get; set; }
     }
 
     /// <summary>
@@ -143,6 +149,7 @@ namespace LiteSql.Mapping
 
             // Build association mappings from [Association] attributes
             var associations = new List<AssociationMapping>();
+            var collectionAssociations = new List<AssociationMapping>();
             foreach (var prop in type.GetProperties(BindingFlags.Public | BindingFlags.Instance))
             {
                 var assocAttr = prop.GetCustomAttribute<AssociationAttribute>();
@@ -157,6 +164,30 @@ namespace LiteSql.Mapping
                         OtherType = prop.PropertyType
                     });
                 }
+                else if (assocAttr != null && !assocAttr.IsForeignKey)
+                {
+                    // One-to-many collection navigation
+                    var collectionType = prop.PropertyType;
+                    Type elementType = null;
+
+                    // Extract element type from List<T>, IList<T>, IEnumerable<T>, EntitySet<T>
+                    if (collectionType.IsGenericType)
+                    {
+                        elementType = collectionType.GetGenericArguments()[0];
+                    }
+
+                    if (elementType != null)
+                    {
+                        collectionAssociations.Add(new AssociationMapping
+                        {
+                            Property = prop,
+                            ThisKey = assocAttr.ThisKey,    // PK on parent
+                            OtherKey = assocAttr.OtherKey,  // FK on child
+                            IsForeignKey = false,
+                            OtherType = elementType
+                        });
+                    }
+                }
             }
 
             return new EntityMapping
@@ -167,7 +198,8 @@ namespace LiteSql.Mapping
                 PrimaryKeys = primaryKeys,
                 InsertableColumns = insertable,
                 UpdatableColumns = updatable,
-                Associations = associations
+                Associations = associations,
+                CollectionAssociations = collectionAssociations
             };
         }
 

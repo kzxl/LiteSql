@@ -423,6 +423,7 @@ namespace LiteSql
                 new CommandDefinition(sql, transaction: _context.Transaction,
                     commandTimeout: _context.CommandTimeout, cancellationToken: ct)).ConfigureAwait(false)).ToList();
             TrackResults(results, mapping);
+            await LoadAssociationsAsync(results, mapping, ct).ConfigureAwait(false);
             return results;
         }
 
@@ -819,27 +820,49 @@ namespace LiteSql
         private void LoadAssociations(List<T> entities, EntityMapping mapping)
         {
             if (entities == null || entities.Count == 0) return;
-            if (mapping.Associations == null || mapping.Associations.Count == 0) return;
 
-            IEnumerable<AssociationMapping> assocsToLoad;
-
-            if (_context.LoadOptions != null)
+            // Load many-to-one FK associations
+            if (mapping.Associations != null && mapping.Associations.Count > 0)
             {
-                // Selective mode: only load registered properties
-                var loadRules = _context.LoadOptions.GetLoadRules(typeof(T));
-                if (loadRules.Count == 0) return;
-                assocsToLoad = mapping.Associations
-                    .Where(a => a.IsForeignKey && loadRules.Any(r => r.Name == a.Property.Name));
+                IEnumerable<AssociationMapping> assocsToLoad;
+
+                if (_context.LoadOptions != null)
+                {
+                    var loadRules = _context.LoadOptions.GetLoadRules(typeof(T));
+                    if (loadRules.Count > 0)
+                    {
+                        assocsToLoad = mapping.Associations
+                            .Where(a => a.IsForeignKey && loadRules.Any(r => r.Name == a.Property.Name));
+                        foreach (var assoc in assocsToLoad)
+                            LoadFkAssociation(entities, assoc);
+                    }
+                }
+                else
+                {
+                    assocsToLoad = mapping.Associations.Where(a => a.IsForeignKey);
+                    foreach (var assoc in assocsToLoad)
+                        LoadFkAssociation(entities, assoc);
+                }
             }
-            else
-            {
-                // Auto mode: load ALL FK associations
-                assocsToLoad = mapping.Associations.Where(a => a.IsForeignKey);
-            }
 
-            foreach (var assoc in assocsToLoad)
+            // Load one-to-many collection associations
+            if (mapping.CollectionAssociations != null && mapping.CollectionAssociations.Count > 0)
             {
-                LoadFkAssociation(entities, assoc);
+                IEnumerable<AssociationMapping> colAssocsToLoad;
+
+                if (_context.LoadOptions != null)
+                {
+                    var loadRules = _context.LoadOptions.GetLoadRules(typeof(T));
+                    colAssocsToLoad = mapping.CollectionAssociations
+                        .Where(a => loadRules.Any(r => r.Name == a.Property.Name));
+                }
+                else
+                {
+                    colAssocsToLoad = mapping.CollectionAssociations;
+                }
+
+                foreach (var assoc in colAssocsToLoad)
+                    LoadCollectionAssociation(entities, assoc);
             }
         }
 
@@ -913,25 +936,49 @@ namespace LiteSql
             CancellationToken ct = default)
         {
             if (entities == null || entities.Count == 0) return;
-            if (mapping.Associations == null || mapping.Associations.Count == 0) return;
 
-            IEnumerable<AssociationMapping> assocsToLoad;
-
-            if (_context.LoadOptions != null)
+            // Load many-to-one FK associations
+            if (mapping.Associations != null && mapping.Associations.Count > 0)
             {
-                var loadRules = _context.LoadOptions.GetLoadRules(typeof(T));
-                if (loadRules.Count == 0) return;
-                assocsToLoad = mapping.Associations
-                    .Where(a => a.IsForeignKey && loadRules.Any(r => r.Name == a.Property.Name));
+                IEnumerable<AssociationMapping> assocsToLoad;
+
+                if (_context.LoadOptions != null)
+                {
+                    var loadRules = _context.LoadOptions.GetLoadRules(typeof(T));
+                    if (loadRules.Count > 0)
+                    {
+                        assocsToLoad = mapping.Associations
+                            .Where(a => a.IsForeignKey && loadRules.Any(r => r.Name == a.Property.Name));
+                        foreach (var assoc in assocsToLoad)
+                            await LoadFkAssociationAsync(entities, assoc, ct).ConfigureAwait(false);
+                    }
+                }
+                else
+                {
+                    assocsToLoad = mapping.Associations.Where(a => a.IsForeignKey);
+                    foreach (var assoc in assocsToLoad)
+                        await LoadFkAssociationAsync(entities, assoc, ct).ConfigureAwait(false);
+                }
             }
-            else
-            {
-                assocsToLoad = mapping.Associations.Where(a => a.IsForeignKey);
-            }
 
-            foreach (var assoc in assocsToLoad)
+            // Load one-to-many collection associations
+            if (mapping.CollectionAssociations != null && mapping.CollectionAssociations.Count > 0)
             {
-                await LoadFkAssociationAsync(entities, assoc, ct).ConfigureAwait(false);
+                IEnumerable<AssociationMapping> colAssocsToLoad;
+
+                if (_context.LoadOptions != null)
+                {
+                    var loadRules = _context.LoadOptions.GetLoadRules(typeof(T));
+                    colAssocsToLoad = mapping.CollectionAssociations
+                        .Where(a => loadRules.Any(r => r.Name == a.Property.Name));
+                }
+                else
+                {
+                    colAssocsToLoad = mapping.CollectionAssociations;
+                }
+
+                foreach (var assoc in colAssocsToLoad)
+                    await LoadCollectionAssociationAsync(entities, assoc, ct).ConfigureAwait(false);
             }
         }
 
@@ -988,6 +1035,150 @@ namespace LiteSql
                 if (fkVal != null && lookup.TryGetValue(fkVal, out var relatedEntity))
                 {
                     assoc.Property.SetValue(entity, relatedEntity);
+                }
+            }
+        }
+
+        /// <summary>
+        /// Loads a one-to-many collection association for all entities using a batch IN query.
+        /// Groups children by FK value and sets the collection property.
+        /// </summary>
+        private void LoadCollectionAssociation(List<T> entities, AssociationMapping assoc)
+        {
+            // ThisKey is PK on parent, OtherKey is FK on child
+            var pkProp = typeof(T).GetProperty(assoc.ThisKey);
+            if (pkProp == null) return;
+
+            var pkValues = entities
+                .Select(e => pkProp.GetValue(e))
+                .Where(v => v != null && !v.Equals(GetDefault(pkProp.PropertyType)))
+                .Distinct()
+                .ToList();
+
+            if (pkValues.Count == 0) return;
+
+            var childMapping = MappingCache.GetMapping(assoc.OtherType);
+            var quotedTable = SqlGenerator.QuoteTableName(childMapping.TableName);
+
+            var dp = new DynamicParameters();
+            var paramNames = new List<string>();
+            for (int i = 0; i < pkValues.Count; i++)
+            {
+                var pName = $"@ck{i}";
+                paramNames.Add(pName);
+                dp.Add(pName, pkValues[i]);
+            }
+
+            var sql = $"SELECT * FROM {quotedTable} WHERE [{assoc.OtherKey}] IN ({string.Join(", ", paramNames)})";
+
+            _context.EnsureConnectionOpen();
+            var children = _context.Connection.Query(
+                assoc.OtherType, sql, dp,
+                transaction: _context.Transaction,
+                commandTimeout: _context.CommandTimeout).ToList();
+
+            // Group children by FK value
+            var fkPropOnChild = assoc.OtherType.GetProperty(assoc.OtherKey);
+            if (fkPropOnChild == null) return;
+
+            var grouped = new Dictionary<object, System.Collections.IList>();
+            foreach (var child in children)
+            {
+                var fkVal = fkPropOnChild.GetValue(child);
+                if (fkVal == null) continue;
+                if (!grouped.TryGetValue(fkVal, out var list))
+                {
+                    list = (System.Collections.IList)Activator.CreateInstance(
+                        typeof(List<>).MakeGenericType(assoc.OtherType));
+                    grouped[fkVal] = list;
+                }
+                list.Add(child);
+            }
+
+            // Set collection on each parent
+            foreach (var entity in entities)
+            {
+                var pkVal = pkProp.GetValue(entity);
+                if (pkVal != null && grouped.TryGetValue(pkVal, out var childList))
+                {
+                    assoc.Property.SetValue(entity, childList);
+                }
+                else
+                {
+                    // Set empty list if no children found
+                    var emptyList = (System.Collections.IList)Activator.CreateInstance(
+                        typeof(List<>).MakeGenericType(assoc.OtherType));
+                    assoc.Property.SetValue(entity, emptyList);
+                }
+            }
+        }
+
+        /// <summary>
+        /// Async version of LoadCollectionAssociation.
+        /// </summary>
+        private async Task LoadCollectionAssociationAsync(List<T> entities, AssociationMapping assoc,
+            CancellationToken ct = default)
+        {
+            var pkProp = typeof(T).GetProperty(assoc.ThisKey);
+            if (pkProp == null) return;
+
+            var pkValues = entities
+                .Select(e => pkProp.GetValue(e))
+                .Where(v => v != null && !v.Equals(GetDefault(pkProp.PropertyType)))
+                .Distinct()
+                .ToList();
+
+            if (pkValues.Count == 0) return;
+
+            var childMapping = MappingCache.GetMapping(assoc.OtherType);
+            var quotedTable = SqlGenerator.QuoteTableName(childMapping.TableName);
+
+            var dp = new DynamicParameters();
+            var paramNames = new List<string>();
+            for (int i = 0; i < pkValues.Count; i++)
+            {
+                var pName = $"@ck{i}";
+                paramNames.Add(pName);
+                dp.Add(pName, pkValues[i]);
+            }
+
+            var sql = $"SELECT * FROM {quotedTable} WHERE [{assoc.OtherKey}] IN ({string.Join(", ", paramNames)})";
+
+            await _context.EnsureConnectionOpenAsync(ct).ConfigureAwait(false);
+            var children = (await _context.Connection.QueryAsync(
+                assoc.OtherType, sql, dp,
+                transaction: _context.Transaction,
+                commandTimeout: _context.CommandTimeout).ConfigureAwait(false)).ToList();
+
+            var fkPropOnChild = assoc.OtherType.GetProperty(assoc.OtherKey);
+            if (fkPropOnChild == null) return;
+
+            var grouped = new Dictionary<object, System.Collections.IList>();
+            foreach (var child in children)
+            {
+                var fkVal = fkPropOnChild.GetValue(child);
+                if (fkVal == null) continue;
+                if (!grouped.TryGetValue(fkVal, out var list))
+                {
+                    list = (System.Collections.IList)Activator.CreateInstance(
+                        typeof(List<>).MakeGenericType(assoc.OtherType));
+                    grouped[fkVal] = list;
+                }
+                list.Add(child);
+            }
+
+            foreach (var entity in entities)
+            {
+                var pkVal = pkProp.GetValue(entity);
+                if (pkVal != null && grouped.TryGetValue(pkVal, out var childList))
+                {
+                    assoc.Property.SetValue(entity, childList);
+                }
+                else
+                {
+                    var emptyList = (System.Collections.IList)Activator.CreateInstance(
+                        typeof(List<>).MakeGenericType(assoc.OtherType));
+                    assoc.Property.SetValue(entity, emptyList);
                 }
             }
         }

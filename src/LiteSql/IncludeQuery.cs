@@ -212,15 +212,29 @@ namespace LiteSql
         private void LoadIncludedAssociations(List<T> entities, EntityMapping mapping)
         {
             if (entities.Count == 0 || _includes.Count == 0) return;
-            if (mapping.Associations == null || mapping.Associations.Count == 0) return;
 
-            foreach (var navProp in _includes)
+            // Load many-to-one FK associations
+            if (mapping.Associations != null)
             {
-                var assoc = mapping.Associations
-                    .FirstOrDefault(a => a.IsForeignKey && a.Property.Name == navProp.Name);
-                if (assoc == null) continue;
+                foreach (var navProp in _includes)
+                {
+                    var assoc = mapping.Associations
+                        .FirstOrDefault(a => a.IsForeignKey && a.Property.Name == navProp.Name);
+                    if (assoc != null)
+                        LoadFkAssociation(entities, assoc);
+                }
+            }
 
-                LoadFkAssociation(entities, assoc);
+            // Load one-to-many collection associations
+            if (mapping.CollectionAssociations != null)
+            {
+                foreach (var navProp in _includes)
+                {
+                    var assoc = mapping.CollectionAssociations
+                        .FirstOrDefault(a => a.Property.Name == navProp.Name);
+                    if (assoc != null)
+                        LoadCollectionAssociation(entities, assoc);
+                }
             }
         }
 
@@ -228,15 +242,29 @@ namespace LiteSql
             CancellationToken ct)
         {
             if (entities.Count == 0 || _includes.Count == 0) return;
-            if (mapping.Associations == null || mapping.Associations.Count == 0) return;
 
-            foreach (var navProp in _includes)
+            // Load many-to-one FK associations
+            if (mapping.Associations != null)
             {
-                var assoc = mapping.Associations
-                    .FirstOrDefault(a => a.IsForeignKey && a.Property.Name == navProp.Name);
-                if (assoc == null) continue;
+                foreach (var navProp in _includes)
+                {
+                    var assoc = mapping.Associations
+                        .FirstOrDefault(a => a.IsForeignKey && a.Property.Name == navProp.Name);
+                    if (assoc != null)
+                        await LoadFkAssociationAsync(entities, assoc, ct).ConfigureAwait(false);
+                }
+            }
 
-                await LoadFkAssociationAsync(entities, assoc, ct).ConfigureAwait(false);
+            // Load one-to-many collection associations
+            if (mapping.CollectionAssociations != null)
+            {
+                foreach (var navProp in _includes)
+                {
+                    var assoc = mapping.CollectionAssociations
+                        .FirstOrDefault(a => a.Property.Name == navProp.Name);
+                    if (assoc != null)
+                        await LoadCollectionAssociationAsync(entities, assoc, ct).ConfigureAwait(false);
+                }
             }
         }
 
@@ -329,6 +357,108 @@ namespace LiteSql
                 var fk = fkProp.GetValue(entity);
                 if (fk != null && lookup.TryGetValue(fk, out var rel))
                     assoc.Property.SetValue(entity, rel);
+            }
+        }
+
+        /// <summary>
+        /// Loads a one-to-many collection association using batch IN query.
+        /// </summary>
+        private void LoadCollectionAssociation(List<T> entities, AssociationMapping assoc)
+        {
+            var pkProp = typeof(T).GetProperty(assoc.ThisKey);
+            if (pkProp == null) return;
+
+            var pkValues = entities.Select(e => pkProp.GetValue(e))
+                .Where(v => v != null && !v.Equals(GetDefault(pkProp.PropertyType)))
+                .Distinct().ToList();
+            if (pkValues.Count == 0) return;
+
+            var childMapping = MappingCache.GetMapping(assoc.OtherType);
+            var quotedTable = SqlGenerator.QuoteTableName(childMapping.TableName);
+            var dp = new DynamicParameters();
+            var pn = new List<string>();
+            for (int i = 0; i < pkValues.Count; i++) { pn.Add($"@ck{i}"); dp.Add($"@ck{i}", pkValues[i]); }
+
+            var sql = $"SELECT * FROM {quotedTable} WHERE [{assoc.OtherKey}] IN ({string.Join(", ", pn)})";
+            _context.EnsureConnectionOpen();
+            var children = _context.Connection.Query(assoc.OtherType, sql, dp,
+                transaction: _context.Transaction, commandTimeout: _context.CommandTimeout).ToList();
+
+            var fkPropOnChild = assoc.OtherType.GetProperty(assoc.OtherKey);
+            if (fkPropOnChild == null) return;
+
+            var grouped = new Dictionary<object, System.Collections.IList>();
+            foreach (var child in children)
+            {
+                var fkVal = fkPropOnChild.GetValue(child);
+                if (fkVal == null) continue;
+                if (!grouped.TryGetValue(fkVal, out var list))
+                {
+                    list = (System.Collections.IList)Activator.CreateInstance(typeof(List<>).MakeGenericType(assoc.OtherType));
+                    grouped[fkVal] = list;
+                }
+                list.Add(child);
+            }
+
+            foreach (var entity in entities)
+            {
+                var pkVal = pkProp.GetValue(entity);
+                if (pkVal != null && grouped.TryGetValue(pkVal, out var cl))
+                    assoc.Property.SetValue(entity, cl);
+                else
+                    assoc.Property.SetValue(entity, (System.Collections.IList)Activator.CreateInstance(typeof(List<>).MakeGenericType(assoc.OtherType)));
+            }
+        }
+
+        /// <summary>
+        /// Async LoadCollectionAssociation.
+        /// </summary>
+        private async Task LoadCollectionAssociationAsync(List<T> entities, AssociationMapping assoc,
+            CancellationToken ct)
+        {
+            var pkProp = typeof(T).GetProperty(assoc.ThisKey);
+            if (pkProp == null) return;
+
+            var pkValues = entities.Select(e => pkProp.GetValue(e))
+                .Where(v => v != null && !v.Equals(GetDefault(pkProp.PropertyType)))
+                .Distinct().ToList();
+            if (pkValues.Count == 0) return;
+
+            var childMapping = MappingCache.GetMapping(assoc.OtherType);
+            var quotedTable = SqlGenerator.QuoteTableName(childMapping.TableName);
+            var dp = new DynamicParameters();
+            var pn = new List<string>();
+            for (int i = 0; i < pkValues.Count; i++) { pn.Add($"@ck{i}"); dp.Add($"@ck{i}", pkValues[i]); }
+
+            var sql = $"SELECT * FROM {quotedTable} WHERE [{assoc.OtherKey}] IN ({string.Join(", ", pn)})";
+            await _context.EnsureConnectionOpenAsync(ct).ConfigureAwait(false);
+            var children = (await _context.Connection.QueryAsync(assoc.OtherType, sql, dp,
+                transaction: _context.Transaction, commandTimeout: _context.CommandTimeout)
+                .ConfigureAwait(false)).ToList();
+
+            var fkPropOnChild = assoc.OtherType.GetProperty(assoc.OtherKey);
+            if (fkPropOnChild == null) return;
+
+            var grouped = new Dictionary<object, System.Collections.IList>();
+            foreach (var child in children)
+            {
+                var fkVal = fkPropOnChild.GetValue(child);
+                if (fkVal == null) continue;
+                if (!grouped.TryGetValue(fkVal, out var list))
+                {
+                    list = (System.Collections.IList)Activator.CreateInstance(typeof(List<>).MakeGenericType(assoc.OtherType));
+                    grouped[fkVal] = list;
+                }
+                list.Add(child);
+            }
+
+            foreach (var entity in entities)
+            {
+                var pkVal = pkProp.GetValue(entity);
+                if (pkVal != null && grouped.TryGetValue(pkVal, out var cl))
+                    assoc.Property.SetValue(entity, cl);
+                else
+                    assoc.Property.SetValue(entity, (System.Collections.IList)Activator.CreateInstance(typeof(List<>).MakeGenericType(assoc.OtherType)));
             }
         }
 
