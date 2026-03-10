@@ -28,7 +28,7 @@
 - 🔌 **Multi-database** — SQL Server and SQLite, extensible to others
 - 📦 **.NET Standard 2.0** — Works on both .NET Framework and .NET Core / .NET 5+
 - 🛠️ **Code Generator** — Generate entities from SQL Server database or `.dbml` files
-- 🧪 **172 tests** — Unit, integration & performance tests with SQLite in-memory
+- 🧪 **189 tests** — Unit, integration & performance tests with SQLite in-memory
 
 ## Packages
 
@@ -453,7 +453,7 @@ Or use the Code Generator to regenerate from your database directly.
 
 ```bash
 dotnet build
-dotnet test   # 172 tests
+dotnet test   # 189 tests
 dotnet pack src/LiteSql/LiteSql.csproj -c Release -o ./nupkg
 dotnet pack src/LiteSql.CodeGen/LiteSql.CodeGen.csproj -c Release -o ./nupkg
 ```
@@ -513,6 +513,12 @@ LiteSql is designed as a **lightweight L2S replacement**, not a full-featured OR
 - [x] **Phase 17** — Query Profiler (execution timing, slow query detection)
 - [x] **Phase 18** — Upsert (INSERT OR REPLACE / MERGE)
 - [x] **Phase 19** — Optimistic Concurrency (IsVersion, ConcurrencyException)
+- [x] **Phase 20** — FromSql with named parameters
+- [x] **Phase 21** — Query Tags (TagWith for SQL debugging)
+- [x] **Phase 22** — Async Parity (no-predicate overloads)
+- [x] **Phase 23** — SoftDelete convention ([SoftDelete] attribute)
+- [x] **Phase 24** — Query Interceptor pipeline
+- [x] **Phase 25** — Repository Pattern (IRepository<T>, Repository<T>)
 
 All planned phases are complete! 🎉
 - [ ] **Phase 8 — Bulk & Batch Operations** ⭐ High Priority
