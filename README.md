@@ -28,7 +28,7 @@
 - 🔌 **Multi-database** — SQL Server and SQLite, extensible to others
 - 📦 **.NET Standard 2.0** — Works on both .NET Framework and .NET Core / .NET 5+
 - 🛠️ **Code Generator** — Generate entities from SQL Server database or `.dbml` files
-- 🧪 **130 tests** — Unit, integration & performance tests with SQLite in-memory
+- 🧪 **146 tests** — Unit, integration & performance tests with SQLite in-memory
 
 ## Packages
 
@@ -453,7 +453,7 @@ Or use the Code Generator to regenerate from your database directly.
 
 ```bash
 dotnet build
-dotnet test   # 130 tests
+dotnet test   # 146 tests
 dotnet pack src/LiteSql/LiteSql.csproj -c Release -o ./nupkg
 dotnet pack src/LiteSql.CodeGen/LiteSql.CodeGen.csproj -c Release -o ./nupkg
 ```
@@ -505,11 +505,10 @@ LiteSql is designed as a **lightweight L2S replacement**, not a full-featured OR
 - [x] **Phase 9** — Transaction Helpers (ExecuteInTransaction/Async)
 - [x] **Phase 12** — ChangeTracker API (GetState, Entries<T>, IsTracking)
 - [x] **Phase 13** — SaveHooks (OnBeforeSave/OnAfterSave lifecycle events)
+- [x] **Phase 11** — One-to-Many Collection Navigation (auto-load, Include, batch IN)
+- [x] **Phase 7.5** — Compiled Query Cache (expression structural key)
 
-### Planned (priority order)
-
-- [ ] **Phase 7d — Extended LINQ** ⭐ High Priority
-  - Compiled query cache — Cache expression → SQL for repeated queries
+All planned phases are complete! 🎉
 - [ ] **Phase 8 — Bulk & Batch Operations** ⭐ High Priority
   - `InsertAllOnSubmit(IEnumerable<T>)` with `SqlBulkCopy` backend
   - `BulkInsert<T>(IEnumerable<T>)` — Direct bulk insert (no tracking)
