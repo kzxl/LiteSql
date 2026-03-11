@@ -11,6 +11,35 @@ namespace LiteSql.CodeGen
     public static class CodeGenerator
     {
         /// <summary>
+        /// C# reserved keywords that need @ prefix when used as identifiers.
+        /// </summary>
+        private static readonly HashSet<string> CSharpKeywords = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            "abstract", "as", "base", "bool", "break", "byte", "case", "catch",
+            "char", "checked", "class", "const", "continue", "decimal", "default",
+            "delegate", "do", "double", "else", "enum", "event", "explicit",
+            "extern", "false", "finally", "fixed", "float", "for", "foreach",
+            "goto", "if", "implicit", "in", "int", "interface", "internal",
+            "is", "lock", "long", "namespace", "new", "null", "object",
+            "operator", "out", "override", "params", "private", "protected",
+            "public", "readonly", "ref", "return", "sbyte", "sealed", "short",
+            "sizeof", "stackalloc", "static", "string", "struct", "switch",
+            "this", "throw", "true", "try", "typeof", "uint", "ulong",
+            "unchecked", "unsafe", "ushort", "using", "virtual", "void",
+            "volatile", "while",
+            // Contextual keywords commonly used as SQL column names
+            "add", "from", "get", "group", "into", "join", "let", "orderby",
+            "partial", "remove", "select", "set", "value", "var", "where",
+            "yield", "view", "order", "level", "delete"
+        };
+
+        /// <summary>
+        /// Escapes a name with @ prefix if it is a C# reserved keyword.
+        /// </summary>
+        private static string EscapeIdentifier(string name)
+            => CSharpKeywords.Contains(name) ? $"@{name}" : name;
+
+        /// <summary>
         /// Generates the complete C# file content for a DBML model.
         /// </summary>
         public static string Generate(DbmlModel model, string targetNamespace)
@@ -116,7 +145,8 @@ namespace LiteSql.CodeGen
                 sb.AppendLine($"        [Column({string.Join(", ", attrs)})]");
 
                 var clrType = MapClrType(col.ClrType, col.CanBeNull);
-                sb.AppendLine($"        public {clrType} {col.Name} {{ get; set; }}");
+                var propName = EscapeIdentifier(col.Name);
+                sb.AppendLine($"        public {clrType} {propName} {{ get; set; }}");
                 sb.AppendLine();
             }
 

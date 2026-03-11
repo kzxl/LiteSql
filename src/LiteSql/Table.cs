@@ -222,6 +222,31 @@ namespace LiteSql
         }
 
         /// <summary>
+        /// Returns the only matching entity. Throws if zero or more than one match.
+        /// </summary>
+        public T Single(Expression<Func<T, bool>> predicate)
+        {
+            return ExecuteWhere(predicate).Single();
+        }
+
+        /// <summary>
+        /// Returns the only matching entity, or default if none. Throws if more than one match.
+        /// </summary>
+        public T SingleOrDefault(Expression<Func<T, bool>> predicate)
+        {
+            return ExecuteWhere(predicate).SingleOrDefault();
+        }
+
+        /// <summary>
+        /// Returns first matching entity. Throws if no match.
+        /// </summary>
+        public T First(Expression<Func<T, bool>> predicate)
+        {
+            if (_take == null) _take = 1;
+            return ExecuteWhere(predicate).First();
+        }
+
+        /// <summary>
         /// Executes the current query and returns all matching rows as a List.
         /// Respects OrderBy/Skip/Take if set.
         /// </summary>
@@ -581,6 +606,34 @@ namespace LiteSql
             if (_take == null) _take = 1;
             var results = await ExecuteWhereAsync(null, ct: ct).ConfigureAwait(false);
             return results.FirstOrDefault();
+        }
+
+        /// <summary>
+        /// Async Single. Returns the only matching entity. Throws if zero or more than one.
+        /// </summary>
+        public async Task<T> SingleAsync(Expression<Func<T, bool>> predicate, CancellationToken ct = default)
+        {
+            var results = await ExecuteWhereAsync(predicate, ct: ct).ConfigureAwait(false);
+            return results.Single();
+        }
+
+        /// <summary>
+        /// Async SingleOrDefault. Returns the only match or default. Throws if more than one.
+        /// </summary>
+        public async Task<T> SingleOrDefaultAsync(Expression<Func<T, bool>> predicate, CancellationToken ct = default)
+        {
+            var results = await ExecuteWhereAsync(predicate, ct: ct).ConfigureAwait(false);
+            return results.SingleOrDefault();
+        }
+
+        /// <summary>
+        /// Async First. Returns first matching entity. Throws if no match.
+        /// </summary>
+        public async Task<T> FirstAsync(Expression<Func<T, bool>> predicate, CancellationToken ct = default)
+        {
+            if (_take == null) _take = 1;
+            var results = await ExecuteWhereAsync(predicate, ct: ct).ConfigureAwait(false);
+            return results.First();
         }
 
         /// <summary>
