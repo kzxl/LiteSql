@@ -18,7 +18,7 @@
 - 🔗 **FK Navigation** — Auto-load related entities via `[Association]` attributes
 - 🎯 **Include()** — Selective FK loading per-query, avoiding unnecessary queries
 - 🔄 **L2S-compatible API** — `GetTable<T>()`, `InsertOnSubmit()`, `DeleteOnSubmit()`, `SubmitChanges()`
-- ⚡ **Full Async API** — `SubmitChangesAsync()`, `WhereAsync()`, `FirstOrDefaultAsync()`, `FindAsync()`
+- ⚡ **Full Async API** — `SubmitChangesAsync()`, `WhereAsync()`, `FirstOrDefaultAsync()`, `SingleAsync()`, `FindAsync()`
 - 🔍 **Server-side filtering** — `Where(predicate)` translates LINQ expressions to SQL WHERE
 - 📊 **Sorting & Pagination** — `OrderBy()`, `ThenBy()`, `Skip()`, `Take()` — server-side SQL
 - 🧲 **Find by PK** — `Find()` / `FindAsync()` for efficient primary key lookups
@@ -29,6 +29,7 @@
 - 📦 **.NET Standard 2.0** — Works on both .NET Framework and .NET Core / .NET 5+
 - 🛠️ **Code Generator** — Generate entities from SQL Server database or `.dbml` files
 - 🧪 **204 tests** — Unit, integration & performance tests with SQLite in-memory
+- 🔑 **CodeGen Keyword Escaping** — Auto-escapes C# reserved keywords (`From` → `@From`)
 
 ## Packages
 
@@ -133,6 +134,9 @@ using (var db = RAFInventoryDataContext.New())
 {
     var users  = await db.tbSYS_Users.WhereAsync(u => u.Status);
     var user   = await db.tbSYS_Users.FirstOrDefaultAsync(u => u.Username == "admin");
+    var first  = await db.tbSYS_Users.FirstAsync(u => u.Status);
+    var single = await db.tbSYS_Users.SingleAsync(u => u.Username == "admin");
+    var maybe  = await db.tbSYS_Users.SingleOrDefaultAsync(u => u.Username == "admin");
     var count  = await db.tbSYS_Users.CountAsync(u => u.Status);
     var exists = await db.tbSYS_Users.AnyAsync(u => u.Username == "admin");
     var all    = await db.tbSYS_Users.ToListAsync();
@@ -165,6 +169,12 @@ db.Products.Where(p => ids.Contains(p.CategoryId));
 
 db.Products.FirstOrDefault(p => p.Id == 1);
 // → SELECT TOP 1 * FROM [Products] WHERE [Id] = @w0
+
+db.Products.Single(p => p.Code == "ABC");
+// → SELECT * FROM [Products] WHERE [Code] = @w0 (throws if 0 or >1 results)
+
+db.Products.SingleOrDefault(p => p.Code == "ABC");
+// → SELECT * FROM [Products] WHERE [Code] = @w0 (returns null if 0, throws if >1)
 ```
 
 ## Sorting & Pagination
@@ -391,6 +401,8 @@ dotnet tool update --global LiteSql.CodeGen --add-source path/to/LiteSql/nupkg
 | `db.Connection` / `Transaction` | ✅ Same | |
 | `[Table]`, `[Column]` | ✅ Same | Change `using` only |
 | `.Where()`, `.FirstOrDefault()` | ✅ Server-side SQL | Via WhereBuilder |
+| `.Single()`, `.SingleOrDefault()` | ✅ Server-side SQL | Instance methods |
+| `.First()` | ✅ Server-side SQL | Instance method |
 | Update tracking | ✅ Snapshot-based | Auto-detect |
 
 ### Beyond L2S (EF Core-inspired)
@@ -408,7 +420,8 @@ dotnet tool update --global LiteSql.CodeGen --add-source path/to/LiteSql/nupkg
 | Dirty Update | Only changed columns are UPDATEd |
 | Insert + Get ID | `InsertAndGetId<T>()`, `InsertAndGetIdAsync<T>()` |
 | Transaction Helper | `ExecuteInTransaction()`, `ExecuteInTransactionAsync()` |
-| Async queries | `WhereAsync()`, `FirstOrDefaultAsync()`, `CountAsync()`, `AnyAsync()`, `ToListAsync()` |
+| Single entity | `Single()`, `SingleOrDefault()`, `First()` |
+| Async queries | `WhereAsync()`, `FirstOrDefaultAsync()`, `SingleAsync()`, `SingleOrDefaultAsync()`, `FirstAsync()`, `CountAsync()`, `AnyAsync()`, `ToListAsync()` |
 | Async submit | `SubmitChangesAsync()` |
 | Async raw SQL | `ExecuteQueryAsync()`, `ExecuteCommandAsync()` |
 
@@ -467,14 +480,10 @@ LiteSql is designed as a **lightweight L2S replacement**, not a full-featured OR
 | Category | Feature | Description |
 |---|---|---|
 | **Schema** | Migration | No `Add-Migration` / `Update-Database`. Schema managed externally (SQL scripts, SSMS). CodeGen is DB → Code only |
-| **Performance** | Bulk Insert | `BulkInsert()` with batched INSERT VALUES. No `SqlBulkCopy` for SQL Server yet |
+| **Performance** | SqlBulkCopy | Has batched `BulkInsert()` with INSERT VALUES. No `SqlBulkCopy` for SQL Server yet |
 | **Performance** | Split Query | No `AsSplitQuery()`. `Include()` uses batch IN queries (good enough for most cases) |
-| **LINQ** | Full LINQ Provider | `Where`, `FirstOrDefault`, `Any`, `Count`, `OrderBy`, `ThenBy`, `Skip`, `Take`, `Select`, `Max`, `Min`, `Sum`, `Average`, `Distinct`. No `GroupBy`, `Join` |
-| **Transaction** | Transaction Helpers | Has basic `db.Transaction` + auto-transaction in `SubmitChanges`. No `ExecuteInTransaction(action)`, `SavePoint`, or `TransactionScope` |
+| **LINQ** | Full LINQ Provider | Has `Where`, `FirstOrDefault`, `Single`, `SingleOrDefault`, `First`, `Any`, `Count`, `OrderBy`, `ThenBy`, `Skip`, `Take`, `Select`, `Max`, `Min`, `Sum`, `Average`, `Distinct`, `Contains/IN`. No `GroupBy`, `Join` |
 | **ORM** | Graph Insert/Update | Cannot insert/update an entire object graph (parent + children) in one call |
-| **ORM** | Collection Navigation | FK navigation is parent-only (many-to-one). No `Order.OrderDetails` (one-to-many) collections |
-| **ORM** | ChangeTracker API | Has snapshot-based update tracking, but no `ChangeTracker.Entries()` to query entity states at runtime |
-| **ORM** | Interceptors / Hooks | No `SaveChanges` interceptors, query filters, or soft-delete hooks |
 | **ORM** | Lazy Loading | No proxy-based or explicit lazy loading |
 
 ### By Design (Won't Implement)
@@ -522,37 +531,7 @@ LiteSql is designed as a **lightweight L2S replacement**, not a full-featured OR
 - [x] **Phase 26** — Value Converters (model⇔database type conversion)
 - [x] **Phase 27** — Contains/IN clause verification + WhereBuilder improvements
 
-All planned phases are complete! 🎉
-- [ ] **Phase 8 — Bulk & Batch Operations** ⭐ High Priority
-  - `InsertAllOnSubmit(IEnumerable<T>)` with `SqlBulkCopy` backend
-  - `BulkInsert<T>(IEnumerable<T>)` — Direct bulk insert (no tracking)
-  - `BulkUpdate<T>()`, `BulkDelete<T>()` — Batch DML
-  - Batch command execution — Combine multiple commands per roundtrip
-  - `InsertAndGetId<T>()` — Insert and return generated identity
-- [ ] **Phase 9 — Transaction & Unit of Work**
-  - `db.ExecuteInTransaction(action)` — Auto commit/rollback wrapper
-  - `db.ExecuteInTransactionAsync(func)` — Async variant
-  - `Savepoint` support for nested operations
-  - Improved `SubmitChanges()` batching — Group insert/update/delete by type
-- [ ] **Phase 10 — ChangeTracker & Entity State**
-  - `EntityState` enum: `Unchanged`, `Added`, `Modified`, `Deleted`
-  - `db.ChangeTracker.Entries<T>()` — Query tracked entities and their states
-  - `db.ChangeTracker.HasChanges()` — Quick dirty check
-- [ ] **Phase 11 — Relationship & Navigation**
-  - One-to-many navigation (`Order.OrderDetails`)
-  - `Include(x => x.Children)` for collection loading
-  - `ThenInclude()` — Nested multi-level eager loading
-  - Graph insert — Save parent + children in one `SubmitChanges()` (1 level)
-- [ ] **Phase 12 — Hooks & Filters**
-  - `BeforeSave` / `AfterSave` interceptor hooks
-  - Global query filters — Soft delete (`IsDeleted = false`), multi-tenant
-  - Audit auto-fill — `CreatedDate`, `UpdatedDate`, `CreatedBy` on save
-  - Value converters — Enum ↔ string, JSON column mapping
-- [ ] **Phase 13 — Quality of Life**
-  - `Upsert<T>()` — Insert or update (MERGE / ON CONFLICT)
-  - `ExecuteScalar<T>()` — Single value queries
-  - PostgreSQL provider support
-  - Enhanced logging & diagnostics — Query timing, parameter logging
+All 27 phases complete! 🎉
 
 ### Not Planned
 
@@ -633,7 +612,8 @@ await db.SubmitChangesAsync();
 - 📊 **Dirty Update** — Chỉ UPDATE cột thay đổi, giảm data transfer
 - 🛠️ **Code Gen** — Gen code trực tiếp từ SQL Server hoặc `.dbml`
 - 🔌 **Đa DB** — SQL Server + SQLite
-- 🧪 **97 tests** — Unit, integration & performance
+- 🔑 **CodeGen Keyword Escaping** — Tự động escape C# reserved keywords (`From` → `@From`)
+- 🧪 **204 tests** — Unit, integration & performance
 
 ## Hạn chế
 
@@ -642,34 +622,24 @@ LiteSql được thiết kế là **thay thế nhẹ cho L2S**, không phải OR
 | Nhóm | Feature | Mô tả |
 |---|---|---|
 | **Schema** | Migration | Không có migration. Schema quản lý bằng SQL scripts bên ngoài |
-| **Hiệu năng** | Bulk Insert | Không có `SqlBulkCopy`. Insert từng row |
-| **LINQ** | Full LINQ | Có `Where`, `FirstOrDefault`, `Any`, `Count`, `OrderBy`, `ThenBy`, `Skip`, `Take`, `Select`. Chưa có `GroupBy`, `Join` |
-| **Transaction** | Helpers | Có cơ bản. Chưa có `ExecuteInTransaction()` |
+| **Hiệu năng** | SqlBulkCopy | Có batched `BulkInsert()` (INSERT VALUES). Chưa có `SqlBulkCopy` |
+| **LINQ** | Full LINQ | Có `Where`, `FirstOrDefault`, `Single`, `SingleOrDefault`, `First`, `Any`, `Count`, `OrderBy`, `ThenBy`, `Skip`, `Take`, `Select`, aggregates, `Contains/IN`. Chưa có `GroupBy`, `Join` |
 | **ORM** | Graph Object | Không insert/update cả cây object (parent + children) |
-| **ORM** | Collection Nav | FK navigation chỉ 1 chiều (many-to-one). Chưa có `Order.OrderDetails` |
-| **ORM** | ChangeTracker API | Có snapshot tracking, chưa có API query trạng thái entity |
+| **ORM** | Lazy Loading | Không có lazy loading |
 
 ## Lộ trình
 
 ### Đã hoàn thành
 
-- [x] **Phase 1** — Core: GetTable, CRUD, raw SQL, transactions
-- [x] **Phase 2** — DBML Code Generator, WhereBuilder, convention mapping
-- [x] **Phase 3** — Attach/Detach, server-side queries, update tracking
-- [x] **Phase 4** — Full Async API, Find/FindAsync, AsNoTracking
-- [x] **Phase 5** — Database Schema CodeGen
-- [x] **Phase 6** — FK Navigation, Include API, Performance Tests
-- [x] **Phase 7a** — OrderBy/ThenBy, Skip/Take, Dirty Update, SQL Cache, Compiled Delegates
-- [x] **Phase 7b** — Select Projection, InsertAndGetId, Transaction Helpers
+- [x] **Phase 1–6** — Core, DBML CodeGen, Attach/Detach, Async API, Schema CodeGen, FK Navigation
+- [x] **Phase 7** — OrderBy/ThenBy, Skip/Take, Select Projection, Aggregates, Dirty Update
+- [x] **Phase 8** — BulkInsert, InsertAndGetId
+- [x] **Phase 9** — ExecuteInTransaction/Async
+- [x] **Phase 11** — One-to-Many Collection Navigation
+- [x] **Phase 12** — ChangeTracker API (GetState, Entries, IsTracking)
+- [x] **Phase 13** — SaveHooks (OnBeforeSave/OnAfterSave)
+- [x] **Phase 14–27** — Pagination, Global Filters, Batch Operations, Profiler, Upsert, Concurrency, FromSql, Query Tags, SoftDelete, Interceptors, Repository, Value Converters, Contains/IN
 
-### Dự kiến (theo độ ưu tiên)
-
-- [ ] **Phase 7c — Mở rộng LINQ (tt.)** ⭐ — aggregates, query cache
-- [ ] **Phase 8 — Bulk & Batch** ⭐ — `SqlBulkCopy`, `BulkUpdate`, `BulkDelete`, `InsertAndGetId()`
-- [ ] **Phase 9 — Transaction & Unit of Work** — `ExecuteInTransaction()`, Savepoint, batch submit
-- [ ] **Phase 10 — ChangeTracker & Entity State** — `EntityState`, `Entries<T>()`, `HasChanges()`
-- [ ] **Phase 11 — Relationship & Navigation** — One-to-many, `ThenInclude()`, graph insert
-- [ ] **Phase 12 — Hooks & Filters** — `BeforeSave`/`AfterSave`, soft delete filter, audit auto-fill
-- [ ] **Phase 13 — Tiện ích** — `Upsert()`, `ExecuteScalar()`, PostgreSQL, diagnostics
+Tất cả 27 phase đã hoàn thành! 🎉
 
 > **Ghi chú:** Lazy loading, schema migration, full IQueryable, sharding **không nằm trong kế hoạch** — dùng công cụ ngoài hoặc giải pháp application-level thay thế.
