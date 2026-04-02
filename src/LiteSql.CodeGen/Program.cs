@@ -26,18 +26,19 @@ namespace LiteSql.CodeGen
             var connectionString = "";
             var contextName = "";
             var inputPath = "";
+            var splitFiles = false;
 
             // Detect mode
             if (args[0] == "--connection" || args[0] == "-c")
             {
                 if (args.Length < 2) { Console.Error.WriteLine("Error: Missing connection string."); return 1; }
                 connectionString = args[1];
-                ParseOptions(args, 2, ref outputPath, ref targetNamespace, ref contextName);
+                ParseOptions(args, 2, ref outputPath, ref targetNamespace, ref contextName, ref splitFiles);
             }
             else
             {
                 inputPath = args[0];
-                ParseOptions(args, 1, ref outputPath, ref targetNamespace, ref contextName);
+                ParseOptions(args, 1, ref outputPath, ref targetNamespace, ref contextName, ref splitFiles);
             }
 
             try
@@ -88,17 +89,38 @@ namespace LiteSql.CodeGen
                 }
 
                 // Generate code
-                var code = CodeGenerator.Generate(model, targetNamespace);
+                if (splitFiles)
+                {
+                    // Split mode: Generate one file per entity
+                    var outputDir = string.IsNullOrEmpty(outputPath) ? "Models" : outputPath;
+                    if (!Directory.Exists(outputDir))
+                        Directory.CreateDirectory(outputDir);
 
-                // Write output
-                var outputDir = Path.GetDirectoryName(outputPath);
-                if (!string.IsNullOrEmpty(outputDir) && !Directory.Exists(outputDir))
-                    Directory.CreateDirectory(outputDir);
+                    var files = CodeGenerator.GenerateSplitFiles(model, targetNamespace);
+                    foreach (var file in files)
+                    {
+                        var filePath = Path.Combine(outputDir, file.FileName);
+                        File.WriteAllText(filePath, file.Content);
+                        Console.WriteLine($"  Generated: {filePath}");
+                    }
+                    Console.WriteLine();
+                    Console.WriteLine($"Generated {model.Tables.Count} entity files + 1 DataContext in {outputDir}/");
+                }
+                else
+                {
+                    // Single file mode (default)
+                    var code = CodeGenerator.Generate(model, targetNamespace);
 
-                File.WriteAllText(outputPath, code);
-                Console.WriteLine($"  Output:   {outputPath}");
-                Console.WriteLine();
-                Console.WriteLine($"Generated {model.Tables.Count} entity classes + 1 DataContext.");
+                    // Write output
+                    var outputDir = Path.GetDirectoryName(outputPath);
+                    if (!string.IsNullOrEmpty(outputDir) && !Directory.Exists(outputDir))
+                        Directory.CreateDirectory(outputDir);
+
+                    File.WriteAllText(outputPath, code);
+                    Console.WriteLine($"  Output:   {outputPath}");
+                    Console.WriteLine();
+                    Console.WriteLine($"Generated {model.Tables.Count} entity classes + 1 DataContext.");
+                }
 
                 // Warn about L2S conflict (DBML mode only)
                 if (!string.IsNullOrEmpty(inputPath))
@@ -129,7 +151,7 @@ namespace LiteSql.CodeGen
         }
 
         static void ParseOptions(string[] args, int startIdx,
-            ref string output, ref string ns, ref string contextName)
+            ref string output, ref string ns, ref string contextName, ref bool splitFiles)
         {
             for (int i = startIdx; i < args.Length; i++)
             {
@@ -141,6 +163,10 @@ namespace LiteSql.CodeGen
                         if (i + 1 < args.Length) ns = args[++i]; break;
                     case "--context":
                         if (i + 1 < args.Length) contextName = args[++i]; break;
+                    case "--split":
+                        splitFiles = true; break;
+                    case "--single-file":
+                        splitFiles = false; break;
                 }
             }
         }
@@ -154,17 +180,20 @@ namespace LiteSql.CodeGen
             Console.WriteLine("  litesql-codegen -c <connection-string> [options] (from SQL Server)");
             Console.WriteLine();
             Console.WriteLine("Options:");
-            Console.WriteLine("  -o, --output <path>       Output .cs file path");
+            Console.WriteLine("  -o, --output <path>       Output file path (single-file) or directory (split)");
             Console.WriteLine("  -n, --namespace <ns>      Target namespace (default: Models)");
             Console.WriteLine("  -c, --connection <cs>     SQL Server connection string");
             Console.WriteLine("      --context <name>      Override context class name");
+            Console.WriteLine("      --split               Generate one file per entity (recommended for large DBs)");
+            Console.WriteLine("      --single-file         Generate all entities in one file (default)");
             Console.WriteLine("  -h, --help                Show this help");
             Console.WriteLine();
             Console.WriteLine("Examples:");
             Console.WriteLine("  litesql-codegen dbRAF.dbml");
             Console.WriteLine("  litesql-codegen dbRAF.dbml -o Models/dbRAF.cs -n RAF.Models");
+            Console.WriteLine("  litesql-codegen dbRAF.dbml --split -o Models/ -n RAF.Models");
             Console.WriteLine("  litesql-codegen -c \"Server=.;Database=RAFInventory;Trusted_Connection=true\" -n RAF.Models");
-            Console.WriteLine("  litesql-codegen -c \"Server=.;Database=MyDb;...\" --context MyDataContext -o Models/MyDb.cs");
+            Console.WriteLine("  litesql-codegen -c \"Server=.;Database=MyDb;...\" --split -o Models/ --context MyDataContext");
         }
     }
 }
