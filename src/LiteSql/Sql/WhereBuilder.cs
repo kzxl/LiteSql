@@ -314,10 +314,11 @@ namespace LiteSql.Sql
             if (expression is UnaryExpression unary && unary.NodeType == ExpressionType.Convert)
                 return EvaluateExpression(unary.Operand);
 
-            // Fallback: compile and invoke
-            var lambda = Expression.Lambda(expression);
-            var fn = lambda.Compile();
-            return fn.DynamicInvoke();
+            // Fallback: compile and invoke (with caching)
+            var lambda = Expression.Lambda<Func<object>>(
+                Expression.Convert(expression, typeof(object)));
+            var fn = ExpressionCache.GetOrAddFunc<object>(lambda);
+            return fn();
         }
     }
 }
