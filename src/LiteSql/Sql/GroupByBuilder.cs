@@ -1,3 +1,4 @@
+using LiteSql.Dialects;
 using LiteSql.Mapping;
 using System;
 using System.Collections.Generic;
@@ -16,13 +17,15 @@ namespace LiteSql.Sql
     public class GroupByBuilder
     {
         private readonly EntityMapping _mapping;
+        private readonly ISqlDialect _dialect;
         private readonly IDictionary<string, object> _parameters;
         private int _paramIndex;
         private List<GroupByColumn> _groupByColumns;
 
-        public GroupByBuilder(EntityMapping mapping)
+        public GroupByBuilder(EntityMapping mapping, ISqlDialect dialect = null)
         {
             _mapping = mapping ?? throw new ArgumentNullException(nameof(mapping));
+            _dialect = dialect ?? SqlGenerator.DefaultDialect;
             _parameters = new Dictionary<string, object>();
         }
 
@@ -63,7 +66,7 @@ namespace LiteSql.Sql
             var selectClause = BuildSelectClause(selectExpression);
 
             // Build GROUP BY clause
-            var groupByClause = string.Join(", ", _groupByColumns.Select(c => $"[{c.ColumnName}]"));
+            var groupByClause = string.Join(", ", _groupByColumns.Select(c => _dialect.QuoteIdentifier(c.ColumnName)));
 
             // Build HAVING clause if present
             string havingClause = null;
@@ -187,7 +190,7 @@ namespace LiteSql.Sql
                     var columnSql = TranslateSelectArgument(arg);
 
                     if (!string.IsNullOrEmpty(alias))
-                        columns.Add($"{columnSql} AS [{alias}]");
+                        columns.Add($"{columnSql} AS {_dialect.QuoteIdentifier(alias)}");
                     else
                         columns.Add(columnSql);
                 }
@@ -200,7 +203,7 @@ namespace LiteSql.Sql
                     if (binding is MemberAssignment assignment)
                     {
                         var columnSql = TranslateSelectArgument(assignment.Expression);
-                        columns.Add($"{columnSql} AS [{binding.Member.Name}]");
+                        columns.Add($"{columnSql} AS {_dialect.QuoteIdentifier(binding.Member.Name)}");
                     }
                 }
             }
@@ -251,7 +254,7 @@ namespace LiteSql.Sql
                 // Single column GroupBy: g.Key → [CustomerId]
                 if (_groupByColumns.Count == 1)
                 {
-                    return $"[{_groupByColumns[0].ColumnName}]";
+                    return _dialect.QuoteIdentifier(_groupByColumns[0].ColumnName);
                 }
                 else
                 {
@@ -274,7 +277,7 @@ namespace LiteSql.Sql
                     throw new InvalidOperationException(
                         $"Property '{propertyName}' is not part of the GroupBy key.");
 
-                return $"[{column.ColumnName}]";
+                return _dialect.QuoteIdentifier(column.ColumnName);
             }
 
             throw new NotSupportedException(
@@ -323,7 +326,7 @@ namespace LiteSql.Sql
                         var columnName = ExtractColumnFromSelector(selector);
                         // Map Average to AVG (not AVERAGE)
                         var sqlFunc = methodName == "Average" ? "AVG" : methodName.ToUpperInvariant();
-                        return $"{sqlFunc}([{columnName}])";
+                        return $"{sqlFunc}({_dialect.QuoteIdentifier(columnName)})";
 
                     default:
                         throw new NotSupportedException(
@@ -469,7 +472,7 @@ namespace LiteSql.Sql
                 // Single column GroupBy: g.Key → [CustomerId]
                 if (_groupByColumns.Count == 1)
                 {
-                    return $"[{_groupByColumns[0].ColumnName}]";
+                    return _dialect.QuoteIdentifier(_groupByColumns[0].ColumnName);
                 }
                 else
                 {
@@ -492,7 +495,7 @@ namespace LiteSql.Sql
                     throw new InvalidOperationException(
                         $"Property '{propertyName}' is not part of the GroupBy key.");
 
-                return $"[{column.ColumnName}]";
+                return _dialect.QuoteIdentifier(column.ColumnName);
             }
 
             throw new NotSupportedException(

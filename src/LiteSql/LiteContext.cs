@@ -1,5 +1,6 @@
 using Dapper;
 using LiteSql.ChangeTracking;
+using LiteSql.Dialects;
 using LiteSql.Mapping;
 using LiteSql.Sql;
 using System;
@@ -26,6 +27,7 @@ namespace LiteSql
             = new ConcurrentDictionary<Type, object>();
         private readonly ChangeTracker _changeTracker = new ChangeTracker();
         private bool _disposed;
+        private ISqlDialect _dialect;
 
         /// <summary>
         /// Provides lifecycle hooks for entity save operations.
@@ -63,9 +65,10 @@ namespace LiteSql
 
         #region Constructors
 
-        public LiteContext(IDbConnection connection)
+        public LiteContext(IDbConnection connection, ISqlDialect dialect = null)
         {
             Connection = connection ?? throw new ArgumentNullException(nameof(connection));
+            _dialect = dialect ?? SqlDialectFactory.GetDialect(connection);
             _ownsConnection = false;
         }
 
@@ -78,6 +81,7 @@ namespace LiteSql
                 ?? throw new InvalidOperationException(
                     "LiteContext.ConnectionFactory must be set before using the string constructor. " +
                     "Example: LiteContext.ConnectionFactory = cs => new SqlConnection(cs);");
+            _dialect = SqlDialectFactory.GetDialect(Connection);
             _ownsConnection = true;
         }
 
@@ -96,6 +100,11 @@ namespace LiteSql
         public int CommandTimeout { get; set; } = 30;
         public TextWriter Log { get; set; }
         public bool ObjectTrackingEnabled { get; set; } = true;
+
+        /// <summary>
+        /// Gets the SQL dialect used by this context.
+        /// </summary>
+        public ISqlDialect Dialect => _dialect;
 
         /// <summary>
         /// Specifies which navigation properties to eagerly load when querying.
@@ -287,9 +296,10 @@ namespace LiteSql
             Connection.Execute(sql, (object)ToDynamicParameters(parameters),
                 transaction: Transaction, commandTimeout: CommandTimeout);
 
-            var id = Connection.ExecuteScalar<long>(GetLastInsertIdSql(Connection),
+            var pk = mapping.PrimaryKeys.FirstOrDefault(p => p.IsDbGenerated);
+            var id = Connection.ExecuteScalar<long>(_dialect.GetLastInsertIdSql(mapping.TableName, pk?.ColumnName),
                 transaction: Transaction);
-            SetPkValue(mapping.PrimaryKeys.FirstOrDefault(p => p.IsDbGenerated), entity, id);
+            SetPkValue(pk, entity, id);
             return id;
         }
 
@@ -310,10 +320,11 @@ namespace LiteSql
                 transaction: Transaction, commandTimeout: CommandTimeout,
                 cancellationToken: ct)).ConfigureAwait(false);
 
+            var pk = mapping.PrimaryKeys.FirstOrDefault(p => p.IsDbGenerated);
             var id = await Connection.ExecuteScalarAsync<long>(
-                new CommandDefinition(GetLastInsertIdSql(Connection),
+                new CommandDefinition(_dialect.GetLastInsertIdSql(mapping.TableName, pk?.ColumnName),
                     transaction: Transaction, cancellationToken: ct)).ConfigureAwait(false);
-            SetPkValue(mapping.PrimaryKeys.FirstOrDefault(p => p.IsDbGenerated), entity, id);
+            SetPkValue(pk, entity, id);
             return id;
         }
 
@@ -334,8 +345,8 @@ namespace LiteSql
 
             var mapping = MappingCache.GetMapping<T>();
             var columns = mapping.InsertableColumns;
-            var columnNames = string.Join(", ", columns.Select(c => $"[{c.ColumnName}]"));
-            var tableName = SqlGenerator.QuoteTableName(mapping.TableName);
+            var columnNames = string.Join(", ", columns.Select(c => _dialect.QuoteIdentifier(c.ColumnName)));
+            var tableName = SqlGenerator.QuoteTableName(mapping.TableName, _dialect);
 
             var ownTx = Transaction == null;
             var tx = Transaction ?? Connection.BeginTransaction();
@@ -381,8 +392,8 @@ namespace LiteSql
 
             var mapping = MappingCache.GetMapping<T>();
             var columns = mapping.InsertableColumns;
-            var columnNames = string.Join(", ", columns.Select(c => $"[{c.ColumnName}]"));
-            var tableName = SqlGenerator.QuoteTableName(mapping.TableName);
+            var columnNames = string.Join(", ", columns.Select(c => _dialect.QuoteIdentifier(c.ColumnName)));
+            var tableName = SqlGenerator.QuoteTableName(mapping.TableName, _dialect);
 
             var ownTx = Transaction == null;
             var tx = Transaction ?? Connection.BeginTransaction();
@@ -575,7 +586,7 @@ namespace LiteSql
         {
             var pk = mapping.PrimaryKeys.FirstOrDefault(p => p.IsDbGenerated);
             if (pk == null) return;
-            var id = Connection.ExecuteScalar<long>(GetLastInsertIdSql(Connection), transaction: tx);
+            var id = Connection.ExecuteScalar<long>(_dialect.GetLastInsertIdSql(mapping.TableName, pk.ColumnName), transaction: tx);
             SetPkValue(pk, entity, id);
         }
 
@@ -584,7 +595,7 @@ namespace LiteSql
             var pk = mapping.PrimaryKeys.FirstOrDefault(p => p.IsDbGenerated);
             if (pk == null) return;
             var id = await Connection.ExecuteScalarAsync<long>(
-                new CommandDefinition(GetLastInsertIdSql(Connection), transaction: tx, cancellationToken: ct)).ConfigureAwait(false);
+                new CommandDefinition(_dialect.GetLastInsertIdSql(mapping.TableName, pk.ColumnName), transaction: tx, cancellationToken: ct)).ConfigureAwait(false);
             SetPkValue(pk, entity, id);
         }
 
@@ -593,13 +604,6 @@ namespace LiteSql
             if (id <= 0) return;
             var t = Nullable.GetUnderlyingType(pk.Property.PropertyType) ?? pk.Property.PropertyType;
             pk.Property.SetValue(entity, Convert.ChangeType(id, t));
-        }
-
-        internal static string GetLastInsertIdSql(IDbConnection connection)
-        {
-            if (connection.GetType().Name.IndexOf("sqlite", StringComparison.OrdinalIgnoreCase) >= 0)
-                return "SELECT last_insert_rowid()";
-            return "SELECT CAST(SCOPE_IDENTITY() AS BIGINT)";
         }
 
         #endregion

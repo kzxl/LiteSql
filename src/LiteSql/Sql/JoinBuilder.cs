@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Linq.Expressions;
 using System.Text;
+using LiteSql.Dialects;
 using LiteSql.Mapping;
 
 namespace LiteSql.Sql
@@ -15,13 +16,15 @@ namespace LiteSql.Sql
     {
         private readonly EntityMapping _mapping1;
         private readonly EntityMapping _mapping2;
+        private readonly ISqlDialect _dialect;
         private readonly IDictionary<string, object> _parameters;
         private int _paramIndex;
 
-        public JoinBuilder(EntityMapping mapping1, EntityMapping mapping2)
+        public JoinBuilder(EntityMapping mapping1, EntityMapping mapping2, ISqlDialect dialect = null)
         {
             _mapping1 = mapping1 ?? throw new ArgumentNullException(nameof(mapping1));
             _mapping2 = mapping2 ?? throw new ArgumentNullException(nameof(mapping2));
+            _dialect = dialect ?? SqlGenerator.DefaultDialect;
             _parameters = new Dictionary<string, object>();
         }
 
@@ -55,12 +58,14 @@ namespace LiteSql.Sql
 
             // Build JOIN clause
             var joinKeyword = joinType == JoinType.Inner ? "INNER JOIN" : "LEFT JOIN";
-            var joinClause = $"{joinKeyword} [{_mapping2.TableName}] AS t2 ON t1.[{outerKey}] = t2.[{innerKey}]";
+            var table1 = SqlGenerator.QuoteTableName(_mapping1.TableName, _dialect);
+            var table2 = SqlGenerator.QuoteTableName(_mapping2.TableName, _dialect);
+            var joinClause = $"{joinKeyword} {table2} AS t2 ON t1.{_dialect.QuoteIdentifier(outerKey)} = t2.{_dialect.QuoteIdentifier(innerKey)}";
 
             // Combine all parts
             var sql = new StringBuilder();
             sql.Append($"SELECT {selectClause}");
-            sql.Append($" FROM [{_mapping1.TableName}] AS t1");
+            sql.Append($" FROM {table1} AS t1");
             sql.Append($" {joinClause}");
 
             if (!string.IsNullOrEmpty(whereClause))
@@ -111,7 +116,7 @@ namespace LiteSql.Sql
                     var columnSql = TranslateSelectArgument(arg, resultSelector.Parameters[0], resultSelector.Parameters[1]);
 
                     if (!string.IsNullOrEmpty(alias))
-                        columns.Add($"{columnSql} AS [{alias}]");
+                        columns.Add($"{columnSql} AS {_dialect.QuoteIdentifier(alias)}");
                     else
                         columns.Add(columnSql);
                 }
@@ -124,7 +129,7 @@ namespace LiteSql.Sql
                     if (binding is MemberAssignment assignment)
                     {
                         var columnSql = TranslateSelectArgument(assignment.Expression, resultSelector.Parameters[0], resultSelector.Parameters[1]);
-                        columns.Add($"{columnSql} AS [{binding.Member.Name}]");
+                        columns.Add($"{columnSql} AS {_dialect.QuoteIdentifier(binding.Member.Name)}");
                     }
                 }
             }
@@ -158,7 +163,7 @@ namespace LiteSql.Sql
                     if (col == null)
                         throw new InvalidOperationException(
                             $"Property '{propName}' is not a mapped column of '{_mapping1.EntityType.Name}'.");
-                    return $"t1.[{col.ColumnName}]";
+                    return $"t1.{_dialect.QuoteIdentifier(col.ColumnName)}";
                 }
                 else if (param.Name == param2.Name)
                 {
@@ -166,7 +171,7 @@ namespace LiteSql.Sql
                     if (col == null)
                         throw new InvalidOperationException(
                             $"Property '{propName}' is not a mapped column of '{_mapping2.EntityType.Name}'.");
-                    return $"t2.[{col.ColumnName}]";
+                    return $"t2.{_dialect.QuoteIdentifier(col.ColumnName)}";
                 }
             }
 

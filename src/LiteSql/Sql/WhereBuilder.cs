@@ -1,3 +1,4 @@
+using LiteSql.Dialects;
 using LiteSql.Mapping;
 using System;
 using System.Collections;
@@ -26,13 +27,15 @@ namespace LiteSql.Sql
     public class WhereBuilder
     {
         private readonly EntityMapping _mapping;
+        private readonly ISqlDialect _dialect;
         private readonly IDictionary<string, object> _parameters = new Dictionary<string, object>();
         private int _paramIndex;
         private string _paramPrefix = "w";
 
-        public WhereBuilder(EntityMapping mapping)
+        public WhereBuilder(EntityMapping mapping, ISqlDialect dialect = null)
         {
             _mapping = mapping ?? throw new ArgumentNullException(nameof(mapping));
+            _dialect = dialect ?? SqlGenerator.DefaultDialect;
         }
 
         /// <summary>
@@ -152,10 +155,10 @@ namespace LiteSql.Sql
                     .FirstOrDefault(c => c.Property.Name == member.Member.Name);
 
                 if (columnMapping != null)
-                    return $"[{columnMapping.ColumnName}]";
+                    return _dialect.QuoteIdentifier(columnMapping.ColumnName);
 
                 // Fallback: use member name as column name
-                return $"[{member.Member.Name}]";
+                return _dialect.QuoteIdentifier(member.Member.Name);
             }
 
             // Otherwise, evaluate the expression to get its value

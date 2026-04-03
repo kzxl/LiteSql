@@ -1,4 +1,5 @@
 using LiteSql.ChangeTracking;
+using LiteSql.Dialects;
 using LiteSql.Mapping;
 using System;
 using System.Collections.Concurrent;
@@ -10,7 +11,7 @@ using System.Linq;
 namespace LiteSql.Sql
 {
     /// <summary>
-    /// Generates parameterized SQL statements (INSERT, DELETE, SELECT, UPDATE) 
+    /// Generates parameterized SQL statements (INSERT, DELETE, SELECT, UPDATE)
     /// from entity mapping metadata. SQL Server dialect by default.
     /// </summary>
     public static class SqlGenerator
@@ -19,6 +20,11 @@ namespace LiteSql.Sql
         private static readonly ConcurrentDictionary<Type, string> _insertSqlCache = new ConcurrentDictionary<Type, string>();
         private static readonly ConcurrentDictionary<Type, string> _deleteSqlCache = new ConcurrentDictionary<Type, string>();
         private static readonly ConcurrentDictionary<Type, string> _selectAllCache = new ConcurrentDictionary<Type, string>();
+
+        /// <summary>
+        /// Default SQL dialect used when none is specified. Defaults to SQL Server.
+        /// </summary>
+        public static ISqlDialect DefaultDialect { get; set; } = new SqlServerDialect();
         /// <summary>
         /// Generates a SELECT * statement for the entity type.
         /// </summary>
@@ -39,7 +45,7 @@ namespace LiteSql.Sql
             var sql = _insertSqlCache.GetOrAdd(mapping.EntityType, _ =>
             {
                 var columns = mapping.InsertableColumns;
-                var columnNames = columns.Select(c => $"[{c.ColumnName}]");
+                var columnNames = columns.Select(c => QuoteIdentifier(c.ColumnName));
                 var paramNames = columns.Select(c => $"@{c.ColumnName}");
                 return $"INSERT INTO {QuoteTableName(mapping.TableName)} ({string.Join(", ", columnNames)}) " +
                        $"VALUES ({string.Join(", ", paramNames)})";
@@ -69,15 +75,15 @@ namespace LiteSql.Sql
             if (softDelete != null)
             {
                 // Soft delete: UPDATE SET {Column} = 1 WHERE PK = @pk
-                var pkClauses = mapping.PrimaryKeys.Select(pk => $"[{pk.ColumnName}] = @pk_{pk.ColumnName}");
-                sqlTemplate = $"UPDATE {QuoteTableName(mapping.TableName)} SET [{softDelete.ColumnName}] = 1 " +
+                var pkClauses = mapping.PrimaryKeys.Select(pk => $"{QuoteIdentifier(pk.ColumnName)} = @pk_{pk.ColumnName}");
+                sqlTemplate = $"UPDATE {QuoteTableName(mapping.TableName)} SET {QuoteIdentifier(softDelete.ColumnName)} = 1 " +
                               $"WHERE {string.Join(" AND ", pkClauses)}";
             }
             else
             {
                 sqlTemplate = _deleteSqlCache.GetOrAdd(mapping.EntityType, _ =>
                 {
-                    var pkClauses = mapping.PrimaryKeys.Select(pk => $"[{pk.ColumnName}] = @pk_{pk.ColumnName}");
+                    var pkClauses = mapping.PrimaryKeys.Select(pk => $"{QuoteIdentifier(pk.ColumnName)} = @pk_{pk.ColumnName}");
                     return $"DELETE FROM {QuoteTableName(mapping.TableName)} WHERE {string.Join(" AND ", pkClauses)}";
                 });
             }
@@ -105,7 +111,7 @@ namespace LiteSql.Sql
                     $"Cannot generate UPDATE for '{mapping.EntityType.Name}': no updatable columns.");
 
             var setClauses = mapping.UpdatableColumns
-                .Select(c => $"[{c.ColumnName}] = @{c.ColumnName}");
+                .Select(c => $"{QuoteIdentifier(c.ColumnName)} = @{c.ColumnName}");
 
             var whereClause = BuildWhereByPrimaryKeys(mapping, entity, out var whereParams);
 
@@ -142,7 +148,7 @@ namespace LiteSql.Sql
             if (changedColumns.Count == 0)
                 return (null, null); // No changes to persist
 
-            var setClauses = changedColumns.Select(c => $"[{c.ColumnName}] = @{c.ColumnName}");
+            var setClauses = changedColumns.Select(c => $"{QuoteIdentifier(c.ColumnName)} = @{c.ColumnName}");
             var whereClause = BuildWhereByPrimaryKeys(mapping, entity, out var whereParams);
 
             var sql = $"UPDATE {QuoteTableName(mapping.TableName)} " +
@@ -187,7 +193,7 @@ namespace LiteSql.Sql
             foreach (var pk in mapping.PrimaryKeys)
             {
                 var paramName = $"@pk_{pk.ColumnName}";
-                clauses.Add($"[{pk.ColumnName}] = {paramName}");
+                clauses.Add($"{QuoteIdentifier(pk.ColumnName)} = {paramName}");
                 parameters[paramName] = pk.Property.GetValue(entity);
             }
 
@@ -229,7 +235,7 @@ namespace LiteSql.Sql
             if (isSqlite)
             {
                 // SQLite: INSERT OR REPLACE INTO table (cols) VALUES (vals)
-                var columnNames = allCols.Select(c => $"[{c.ColumnName}]");
+                var columnNames = allCols.Select(c => QuoteIdentifier(c.ColumnName));
                 var paramNames = allCols.Select(c => $"@{c.ColumnName}");
                 var sql = $"INSERT OR REPLACE INTO {QuoteTableName(mapping.TableName)} " +
                           $"({string.Join(", ", columnNames)}) VALUES ({string.Join(", ", paramNames)})";
@@ -239,14 +245,14 @@ namespace LiteSql.Sql
             {
                 // SQL Server: MERGE
                 var onClause = string.Join(" AND ",
-                    mapping.PrimaryKeys.Select(pk => $"T.[{pk.ColumnName}] = S.[{pk.ColumnName}]"));
+                    mapping.PrimaryKeys.Select(pk => $"T.{QuoteIdentifier(pk.ColumnName)} = S.{QuoteIdentifier(pk.ColumnName)}"));
                 var updateCols = allCols.Where(c => !c.IsPrimaryKey).ToList();
-                var setClauses = updateCols.Select(c => $"T.[{c.ColumnName}] = @{c.ColumnName}");
-                var insertCols = allCols.Select(c => $"[{c.ColumnName}]");
+                var setClauses = updateCols.Select(c => $"T.{QuoteIdentifier(c.ColumnName)} = @{c.ColumnName}");
+                var insertCols = allCols.Select(c => QuoteIdentifier(c.ColumnName));
                 var insertVals = allCols.Select(c => $"@{c.ColumnName}");
 
                 var sql = $"MERGE {QuoteTableName(mapping.TableName)} AS T " +
-                          $"USING (SELECT {string.Join(", ", mapping.PrimaryKeys.Select(pk => $"@pk_{pk.ColumnName} AS [{pk.ColumnName}]"))}) AS S " +
+                          $"USING (SELECT {string.Join(", ", mapping.PrimaryKeys.Select(pk => $"@pk_{pk.ColumnName} AS {QuoteIdentifier(pk.ColumnName)}"))}) AS S " +
                           $"ON {onClause} " +
                           $"WHEN MATCHED THEN UPDATE SET {string.Join(", ", setClauses)} " +
                           $"WHEN NOT MATCHED THEN INSERT ({string.Join(", ", insertCols)}) VALUES ({string.Join(", ", insertVals)});";
@@ -262,9 +268,33 @@ namespace LiteSql.Sql
         /// </summary>
         internal static string QuoteTableName(string tableName)
         {
+            return QuoteTableName(tableName, DefaultDialect);
+        }
+
+        /// <summary>
+        /// Quotes a table name using the specified dialect.
+        /// </summary>
+        internal static string QuoteTableName(string tableName, ISqlDialect dialect)
+        {
             if (string.IsNullOrEmpty(tableName)) return tableName;
             var parts = tableName.Split('.');
-            return string.Join(".", parts.Select(p => $"[{p}]"));
+            return string.Join(".", parts.Select(p => dialect.QuoteIdentifier(p)));
+        }
+
+        /// <summary>
+        /// Quotes a column name using the default dialect.
+        /// </summary>
+        internal static string QuoteIdentifier(string identifier)
+        {
+            return DefaultDialect.QuoteIdentifier(identifier);
+        }
+
+        /// <summary>
+        /// Quotes a column name using the specified dialect.
+        /// </summary>
+        internal static string QuoteIdentifier(string identifier, ISqlDialect dialect)
+        {
+            return dialect.QuoteIdentifier(identifier);
         }
     }
 }
