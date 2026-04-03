@@ -178,6 +178,39 @@ namespace LiteSql
 
         #endregion
 
+        #region GroupBy
+
+        /// <summary>
+        /// Groups results by the specified key selector.
+        /// Must be followed by Select() to project aggregates.
+        /// Example: db.Orders.GroupBy(o => o.CustomerId).Select(g => new { g.Key, Count = g.Count() })
+        /// </summary>
+        public GroupByQuery<T, TKey> GroupBy<TKey>(Expression<Func<T, TKey>> keySelector)
+        {
+            if (keySelector == null)
+                throw new ArgumentNullException(nameof(keySelector));
+
+            var mapping = MappingCache.GetMapping<T>();
+            var tableName = SqlGenerator.QuoteTableName(mapping.TableName);
+
+            // Capture current WHERE clause state if any filters exist
+            string whereClause = null;
+            IDictionary<string, object> whereParameters = null;
+
+            // Note: OrderBy/Skip/Take before GroupBy are not supported and will be ignored
+            // They should be applied after GroupBy if needed
+
+            return new GroupByQuery<T, TKey>(
+                _context,
+                mapping,
+                tableName,
+                keySelector,
+                whereClause,
+                whereParameters);
+        }
+
+        #endregion
+
         #region Include (selective FK loading)
 
         /// <summary>
