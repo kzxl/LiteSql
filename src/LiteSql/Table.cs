@@ -34,6 +34,10 @@ namespace LiteSql
             _changeTracker = changeTracker ?? throw new ArgumentNullException(nameof(changeTracker));
         }
 
+        // Internal properties for Join support
+        internal System.Data.IDbConnection Connection => _context.Connection;
+        internal System.Data.IDbTransaction Transaction => _context.Transaction;
+
         #region Insert / Delete / Attach
 
         public void InsertOnSubmit(T entity)
