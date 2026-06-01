@@ -1,4 +1,5 @@
 using System;
+using System.Data;
 using System.IO;
 using Microsoft.Data.SqlClient;
 
@@ -27,18 +28,19 @@ namespace LiteSql.CodeGen
             var contextName = "";
             var inputPath = "";
             var splitFiles = false;
+            var provider = "sqlserver";
 
             // Detect mode
             if (args[0] == "--connection" || args[0] == "-c")
             {
                 if (args.Length < 2) { Console.Error.WriteLine("Error: Missing connection string."); return 1; }
                 connectionString = args[1];
-                ParseOptions(args, 2, ref outputPath, ref targetNamespace, ref contextName, ref splitFiles);
+                ParseOptions(args, 2, ref outputPath, ref targetNamespace, ref contextName, ref splitFiles, ref provider);
             }
             else
             {
                 inputPath = args[0];
-                ParseOptions(args, 1, ref outputPath, ref targetNamespace, ref contextName, ref splitFiles);
+                ParseOptions(args, 1, ref outputPath, ref targetNamespace, ref contextName, ref splitFiles, ref provider);
             }
 
             try
@@ -47,14 +49,15 @@ namespace LiteSql.CodeGen
 
                 if (!string.IsNullOrEmpty(connectionString))
                 {
-                    // Mode 2: Read from SQL Server
-                    Console.WriteLine("Connecting to database...");
-                    using (var conn = new SqlConnection(connectionString))
+                    // Mode 2: Read from a live database (provider-aware)
+                    Console.WriteLine($"Connecting to database ({provider})...");
+                    using (var conn = CreateConnection(provider, connectionString))
                     {
                         conn.Open();
                         Console.WriteLine($"  Database: {conn.Database}");
-                        model = DatabaseSchemaReader.ReadSchema(conn, 
-                            string.IsNullOrEmpty(contextName) ? null : contextName);
+                        model = DatabaseSchemaReader.ReadSchema(conn,
+                            string.IsNullOrEmpty(contextName) ? null : contextName,
+                            NormalizeProvider(provider));
                     }
                     Console.WriteLine($"  Context:  {model.ContextClassName}");
                     Console.WriteLine($"  Tables:   {model.Tables.Count}");
@@ -151,7 +154,7 @@ namespace LiteSql.CodeGen
         }
 
         static void ParseOptions(string[] args, int startIdx,
-            ref string output, ref string ns, ref string contextName, ref bool splitFiles)
+            ref string output, ref string ns, ref string contextName, ref bool splitFiles, ref string provider)
         {
             for (int i = startIdx; i < args.Length; i++)
             {
@@ -163,11 +166,45 @@ namespace LiteSql.CodeGen
                         if (i + 1 < args.Length) ns = args[++i]; break;
                     case "--context":
                         if (i + 1 < args.Length) contextName = args[++i]; break;
+                    case "-p": case "--provider":
+                        if (i + 1 < args.Length) provider = args[++i]; break;
                     case "--split":
                         splitFiles = true; break;
                     case "--single-file":
                         splitFiles = false; break;
                 }
+            }
+        }
+
+        /// <summary>
+        /// Creates an ADO.NET connection for the requested provider.
+        /// </summary>
+        static IDbConnection CreateConnection(string provider, string connectionString)
+        {
+            switch (NormalizeProvider(provider))
+            {
+                case DbProvider.MySql:
+                    return new MySqlConnector.MySqlConnection(connectionString);
+                case DbProvider.PostgreSql:
+                    return new Npgsql.NpgsqlConnection(connectionString);
+                case DbProvider.Sqlite:
+                    return new Microsoft.Data.Sqlite.SqliteConnection(connectionString);
+                default:
+                    return new SqlConnection(connectionString);
+            }
+        }
+
+        static DbProvider NormalizeProvider(string provider)
+        {
+            switch ((provider ?? "").Trim().ToLowerInvariant())
+            {
+                case "mysql": case "mariadb": return DbProvider.MySql;
+                case "postgres": case "postgresql": case "pgsql": case "npgsql": return DbProvider.PostgreSql;
+                case "sqlite": return DbProvider.Sqlite;
+                case "sqlserver": case "mssql": case "": return DbProvider.SqlServer;
+                default:
+                    throw new ArgumentException(
+                        $"Unknown provider '{provider}'. Use: sqlserver, mysql, postgresql, or sqlite.");
             }
         }
 
@@ -182,7 +219,8 @@ namespace LiteSql.CodeGen
             Console.WriteLine("Options:");
             Console.WriteLine("  -o, --output <path>       Output file path (single-file) or directory (split)");
             Console.WriteLine("  -n, --namespace <ns>      Target namespace (default: Models)");
-            Console.WriteLine("  -c, --connection <cs>     SQL Server connection string");
+            Console.WriteLine("  -c, --connection <cs>     Database connection string");
+            Console.WriteLine("  -p, --provider <name>     DB provider: sqlserver (default), mysql, postgresql, sqlite");
             Console.WriteLine("      --context <name>      Override context class name");
             Console.WriteLine("      --split               Generate one file per entity (recommended for large DBs)");
             Console.WriteLine("      --single-file         Generate all entities in one file (default)");
@@ -193,7 +231,20 @@ namespace LiteSql.CodeGen
             Console.WriteLine("  litesql-codegen dbRAF.dbml -o Models/dbRAF.cs -n RAF.Models");
             Console.WriteLine("  litesql-codegen dbRAF.dbml --split -o Models/ -n RAF.Models");
             Console.WriteLine("  litesql-codegen -c \"Server=.;Database=RAFInventory;Trusted_Connection=true\" -n RAF.Models");
-            Console.WriteLine("  litesql-codegen -c \"Server=.;Database=MyDb;...\" --split -o Models/ --context MyDataContext");
+            Console.WriteLine("  litesql-codegen -c \"Server=localhost;Database=app;Uid=root;Pwd=...\" -p mysql -n App.Models");
+            Console.WriteLine("  litesql-codegen -c \"Host=localhost;Database=app;Username=postgres;Password=...\" -p postgresql");
+            Console.WriteLine("  litesql-codegen -c \"Data Source=app.db\" -p sqlite -n App.Models");
         }
+    }
+
+    /// <summary>
+    /// Supported database providers for schema reading.
+    /// </summary>
+    public enum DbProvider
+    {
+        SqlServer,
+        MySql,
+        PostgreSql,
+        Sqlite
     }
 }
