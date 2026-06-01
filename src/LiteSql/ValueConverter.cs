@@ -1,6 +1,8 @@
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Data;
+using Dapper;
 
 namespace LiteSql
 {
@@ -55,6 +57,9 @@ namespace LiteSql
                 v => toDb((TModel)v),
                 v => fromDb((TDb)v));
             _converters[typeof(TModel)] = converter;
+
+            // Register a Dapper type handler so reads (SELECT) convert automatically.
+            SqlMapper.AddTypeHandler(typeof(TModel), new ConverterTypeHandler<TModel, TDb>(toDb, fromDb));
         }
 
         /// <summary>
@@ -94,6 +99,19 @@ namespace LiteSql
         }
 
         /// <summary>
+        /// Converts a database value back to its model representation.
+        /// Returns the original value if no converter is registered for the model type.
+        /// </summary>
+        public object ConvertFromDb(object value, Type modelType)
+        {
+            if (value == null) return null;
+            var converter = GetConverter(modelType);
+            if (converter != null)
+                return converter.FromDb(value);
+            return value;
+        }
+
+        /// <summary>
         /// Removes the converter for the specified type.
         /// </summary>
         public void Remove<TModel>()
@@ -107,6 +125,42 @@ namespace LiteSql
         public void Clear()
         {
             _converters.Clear();
+        }
+    }
+
+    /// <summary>
+    /// Dapper type handler that bridges a registered LiteSql value converter,
+    /// enabling automatic model⇄database conversion during reads and parameterization.
+    /// </summary>
+    internal sealed class ConverterTypeHandler<TModel, TDb> : SqlMapper.TypeHandler<TModel>
+    {
+        private readonly Func<TModel, TDb> _toDb;
+        private readonly Func<TDb, TModel> _fromDb;
+
+        public ConverterTypeHandler(Func<TModel, TDb> toDb, Func<TDb, TModel> fromDb)
+        {
+            _toDb = toDb;
+            _fromDb = fromDb;
+        }
+
+        public override void SetValue(IDbDataParameter parameter, TModel value)
+        {
+            parameter.Value = (object)_toDb(value) ?? DBNull.Value;
+        }
+
+        public override TModel Parse(object value)
+        {
+            if (value == null || value is DBNull)
+                return default;
+
+            // Coerce the raw DB value to TDb before invoking the user's converter.
+            TDb dbValue;
+            if (value is TDb tdb)
+                dbValue = tdb;
+            else
+                dbValue = (TDb)Convert.ChangeType(value, Nullable.GetUnderlyingType(typeof(TDb)) ?? typeof(TDb));
+
+            return _fromDb(dbValue);
         }
     }
 }

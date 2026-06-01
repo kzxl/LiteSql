@@ -291,7 +291,7 @@ namespace LiteSql
             EnsureConnectionOpen();
 
             var mapping = MappingCache.GetMapping<T>();
-            var (sql, parameters) = SqlGenerator.GenerateInsert(mapping, entity);
+            var (sql, parameters) = SqlGenerator.GenerateInsert(mapping, entity, _dialect);
             LogSql(sql, parameters);
             Connection.Execute(sql, (object)ToDynamicParameters(parameters),
                 transaction: Transaction, commandTimeout: CommandTimeout);
@@ -313,7 +313,7 @@ namespace LiteSql
             await EnsureConnectionOpenAsync(ct).ConfigureAwait(false);
 
             var mapping = MappingCache.GetMapping<T>();
-            var (sql, parameters) = SqlGenerator.GenerateInsert(mapping, entity);
+            var (sql, parameters) = SqlGenerator.GenerateInsert(mapping, entity, _dialect);
             LogSql(sql, parameters);
             await Connection.ExecuteAsync(new CommandDefinition(
                 sql, (object)ToDynamicParameters(parameters),
@@ -437,7 +437,7 @@ namespace LiteSql
         {
             ThrowIfDisposed();
             var mapping = MappingCache.GetMapping<T>();
-            var sql = SqlGenerator.GenerateUpsert(mapping, entity);
+            var sql = SqlGenerator.GenerateUpsert(mapping, entity, _dialect);
             if (sql == null) throw new InvalidOperationException("Upsert requires at least one primary key column.");
 
             EnsureConnectionOpen();
@@ -452,7 +452,7 @@ namespace LiteSql
         {
             ThrowIfDisposed();
             var mapping = MappingCache.GetMapping<T>();
-            var sql = SqlGenerator.GenerateUpsert(mapping, entity);
+            var sql = SqlGenerator.GenerateUpsert(mapping, entity, _dialect);
             if (sql == null) throw new InvalidOperationException("Upsert requires at least one primary key column.");
 
             await EnsureConnectionOpenAsync(ct).ConfigureAwait(false);
@@ -479,6 +479,174 @@ namespace LiteSql
 
         #endregion
 
+        #region Graph Insert (parent + child collections)
+
+        /// <summary>
+        /// Inserts an entity together with its one-to-many child collections in a single
+        /// transaction. The parent is inserted first; its generated key is propagated to each
+        /// child's foreign-key property; then children are inserted (recursively for nested graphs).
+        /// </summary>
+        public void InsertGraph<T>(T entity) where T : class
+        {
+            if (entity == null) throw new ArgumentNullException(nameof(entity));
+            ThrowIfDisposed();
+            EnsureConnectionOpen();
+
+            var ownTx = Transaction == null;
+            var tx = Transaction ?? Connection.BeginTransaction();
+            var prevTx = Transaction;
+            try
+            {
+                Transaction = tx;
+                InsertGraphNode(entity, entity.GetType());
+                if (ownTx) tx.Commit();
+            }
+            catch { if (ownTx) tx.Rollback(); throw; }
+            finally
+            {
+                Transaction = prevTx;
+                if (ownTx) tx.Dispose();
+            }
+        }
+
+        /// <summary>
+        /// Async version of InsertGraph.
+        /// </summary>
+        public async Task InsertGraphAsync<T>(T entity, CancellationToken ct = default) where T : class
+        {
+            if (entity == null) throw new ArgumentNullException(nameof(entity));
+            ThrowIfDisposed();
+            await EnsureConnectionOpenAsync(ct).ConfigureAwait(false);
+
+            var ownTx = Transaction == null;
+            var tx = Transaction ?? Connection.BeginTransaction();
+            var prevTx = Transaction;
+            try
+            {
+                Transaction = tx;
+                await InsertGraphNodeAsync(entity, entity.GetType(), ct).ConfigureAwait(false);
+                if (ownTx) tx.Commit();
+            }
+            catch { if (ownTx) tx.Rollback(); throw; }
+            finally
+            {
+                Transaction = prevTx;
+                if (ownTx) tx.Dispose();
+            }
+        }
+
+        private void InsertGraphNode(object entity, Type entityType)
+        {
+            var mapping = MappingCache.GetMapping(entityType);
+
+            // Insert the parent and capture its generated key (if any).
+            var (sql, parameters) = SqlGenerator.GenerateInsert(mapping, entity, _dialect);
+            LogSql(sql, parameters);
+            Connection.Execute(sql, (object)ToDynamicParameters(parameters),
+                transaction: Transaction, commandTimeout: CommandTimeout);
+
+            var pk = mapping.PrimaryKeys.FirstOrDefault(p => p.IsDbGenerated);
+            object pkValue;
+            if (pk != null)
+            {
+                var id = Connection.ExecuteScalar<long>(
+                    _dialect.GetLastInsertIdSql(mapping.TableName, pk.ColumnName), transaction: Transaction);
+                SetPkValue(pk, entity, id);
+                pkValue = pk.Property.GetValue(entity);
+            }
+            else
+            {
+                pkValue = mapping.PrimaryKeys.FirstOrDefault()?.Property.GetValue(entity);
+            }
+
+            InsertChildCollections(entity, mapping, pkValue);
+        }
+
+        private async Task InsertGraphNodeAsync(object entity, Type entityType, CancellationToken ct)
+        {
+            var mapping = MappingCache.GetMapping(entityType);
+
+            var (sql, parameters) = SqlGenerator.GenerateInsert(mapping, entity, _dialect);
+            LogSql(sql, parameters);
+            await Connection.ExecuteAsync(new CommandDefinition(
+                sql, (object)ToDynamicParameters(parameters),
+                transaction: Transaction, commandTimeout: CommandTimeout, cancellationToken: ct)).ConfigureAwait(false);
+
+            var pk = mapping.PrimaryKeys.FirstOrDefault(p => p.IsDbGenerated);
+            object pkValue;
+            if (pk != null)
+            {
+                var id = await Connection.ExecuteScalarAsync<long>(new CommandDefinition(
+                    _dialect.GetLastInsertIdSql(mapping.TableName, pk.ColumnName),
+                    transaction: Transaction, cancellationToken: ct)).ConfigureAwait(false);
+                SetPkValue(pk, entity, id);
+                pkValue = pk.Property.GetValue(entity);
+            }
+            else
+            {
+                pkValue = mapping.PrimaryKeys.FirstOrDefault()?.Property.GetValue(entity);
+            }
+
+            await InsertChildCollectionsAsync(entity, mapping, pkValue, ct).ConfigureAwait(false);
+        }
+
+        private void InsertChildCollections(object parent, EntityMapping mapping, object parentKey)
+        {
+            if (mapping.CollectionAssociations == null) return;
+
+            foreach (var assoc in mapping.CollectionAssociations)
+            {
+                var collection = assoc.Property.GetValue(parent) as System.Collections.IEnumerable;
+                if (collection == null) continue;
+
+                var childType = assoc.OtherType;
+                var childMapping = MappingCache.GetMapping(childType);
+                // FK property on the child that references the parent's key.
+                var fkProp = childType.GetProperty(assoc.OtherKey);
+
+                foreach (var child in collection)
+                {
+                    if (child == null) continue;
+                    if (fkProp != null && parentKey != null)
+                        fkProp.SetValue(child, ConvertTo(parentKey, fkProp.PropertyType));
+                    // Recurse so grandchildren are handled too.
+                    InsertGraphNode(child, childType);
+                }
+            }
+        }
+
+        private async Task InsertChildCollectionsAsync(object parent, EntityMapping mapping, object parentKey, CancellationToken ct)
+        {
+            if (mapping.CollectionAssociations == null) return;
+
+            foreach (var assoc in mapping.CollectionAssociations)
+            {
+                var collection = assoc.Property.GetValue(parent) as System.Collections.IEnumerable;
+                if (collection == null) continue;
+
+                var childType = assoc.OtherType;
+                var fkProp = childType.GetProperty(assoc.OtherKey);
+
+                foreach (var child in collection)
+                {
+                    if (child == null) continue;
+                    if (fkProp != null && parentKey != null)
+                        fkProp.SetValue(child, ConvertTo(parentKey, fkProp.PropertyType));
+                    await InsertGraphNodeAsync(child, childType, ct).ConfigureAwait(false);
+                }
+            }
+        }
+
+        private static object ConvertTo(object value, Type targetType)
+        {
+            if (value == null) return null;
+            var t = Nullable.GetUnderlyingType(targetType) ?? targetType;
+            if (t.IsInstanceOfType(value)) return value;
+            return Convert.ChangeType(value, t);
+        }
+
+        #endregion
+
         #region Change Processing
 
         private void ProcessChanges(IReadOnlyList<TrackedEntity> changes, IDbTransaction tx)
@@ -491,28 +659,30 @@ namespace LiteSql
                 switch (tracked.State)
                 {
                     case EntityState.Insert:
-                        ExecuteCrud(mapping, tracked.Entity, tx, SqlGenerator.GenerateInsert);
+                        ExecuteCrud(mapping, tracked.Entity, tx, (m, e) => SqlGenerator.GenerateInsert(m, e, _dialect));
                         SetAutoGeneratedId(mapping, tracked.Entity, tx);
                         break;
                     case EntityState.Update:
                         if (tracked.ChangedProperties != null)
                         {
                             var (sql, parameters) = SqlGenerator.GeneratePartialUpdate(
-                                mapping, tracked.Entity, tracked.ChangedProperties);
+                                mapping, tracked.Entity, tracked.ChangedProperties, _dialect);
                             if (sql != null)
                             {
                                 LogSql(sql, parameters);
-                                Connection.Execute(sql, (object)ToDynamicParameters(parameters),
+                                var affected = Connection.Execute(sql, (object)ToDynamicParameters(parameters),
                                     transaction: tx, commandTimeout: CommandTimeout);
+                                CheckConcurrency(mapping, tracked.Entity, affected);
                             }
                         }
                         else
                         {
-                            ExecuteCrud(mapping, tracked.Entity, tx, SqlGenerator.GenerateUpdate);
+                            var affected = ExecuteCrud(mapping, tracked.Entity, tx, (m, e) => SqlGenerator.GenerateUpdate(m, e, _dialect));
+                            CheckConcurrency(mapping, tracked.Entity, affected);
                         }
                         break;
                     case EntityState.Delete:
-                        ExecuteCrud(mapping, tracked.Entity, tx, SqlGenerator.GenerateDelete);
+                        ExecuteCrud(mapping, tracked.Entity, tx, (m, e) => SqlGenerator.GenerateDelete(m, e, _dialect));
                         break;
                 }
 
@@ -528,54 +698,66 @@ namespace LiteSql
                 switch (tracked.State)
                 {
                     case EntityState.Insert:
-                        await ExecuteCrudAsync(mapping, tracked.Entity, tx, SqlGenerator.GenerateInsert, ct).ConfigureAwait(false);
+                        await ExecuteCrudAsync(mapping, tracked.Entity, tx, (m, e) => SqlGenerator.GenerateInsert(m, e, _dialect), ct).ConfigureAwait(false);
                         await SetAutoGeneratedIdAsync(mapping, tracked.Entity, tx, ct).ConfigureAwait(false);
                         break;
                     case EntityState.Update:
                         if (tracked.ChangedProperties != null)
                         {
                             var (sql, parameters) = SqlGenerator.GeneratePartialUpdate(
-                                mapping, tracked.Entity, tracked.ChangedProperties);
+                                mapping, tracked.Entity, tracked.ChangedProperties, _dialect);
                             if (sql != null)
                             {
                                 LogSql(sql, parameters);
-                                await Connection.ExecuteAsync(new CommandDefinition(
+                                var affected = await Connection.ExecuteAsync(new CommandDefinition(
                                     sql, (object)ToDynamicParameters(parameters),
                                     transaction: tx, commandTimeout: CommandTimeout,
                                     cancellationToken: ct)).ConfigureAwait(false);
+                                CheckConcurrency(mapping, tracked.Entity, affected);
                             }
                         }
                         else
                         {
-                            await ExecuteCrudAsync(mapping, tracked.Entity, tx, SqlGenerator.GenerateUpdate, ct).ConfigureAwait(false);
+                            var affected = await ExecuteCrudAsync(mapping, tracked.Entity, tx, (m, e) => SqlGenerator.GenerateUpdate(m, e, _dialect), ct).ConfigureAwait(false);
+                            CheckConcurrency(mapping, tracked.Entity, affected);
                         }
                         break;
                     case EntityState.Delete:
-                        await ExecuteCrudAsync(mapping, tracked.Entity, tx, SqlGenerator.GenerateDelete, ct).ConfigureAwait(false);
+                        await ExecuteCrudAsync(mapping, tracked.Entity, tx, (m, e) => SqlGenerator.GenerateDelete(m, e, _dialect), ct).ConfigureAwait(false);
                         break;
                 }
             }
         }
 
-        private void ExecuteCrud(EntityMapping mapping, object entity, IDbTransaction tx,
+        private int ExecuteCrud(EntityMapping mapping, object entity, IDbTransaction tx,
             Func<EntityMapping, object, (string, IDictionary<string, object>)> generator)
         {
             var (sql, parameters) = generator(mapping, entity);
             ApplyConverters(parameters, mapping);
             LogSql(sql, parameters);
-            Connection.Execute(sql, (object)ToDynamicParameters(parameters),
+            return Connection.Execute(sql, (object)ToDynamicParameters(parameters),
                 transaction: tx, commandTimeout: CommandTimeout);
         }
 
-        private async Task ExecuteCrudAsync(EntityMapping mapping, object entity, IDbTransaction tx,
+        private async Task<int> ExecuteCrudAsync(EntityMapping mapping, object entity, IDbTransaction tx,
             Func<EntityMapping, object, (string, IDictionary<string, object>)> generator, CancellationToken ct)
         {
             var (sql, parameters) = generator(mapping, entity);
             ApplyConverters(parameters, mapping);
             LogSql(sql, parameters);
-            await Connection.ExecuteAsync(new CommandDefinition(
+            return await Connection.ExecuteAsync(new CommandDefinition(
                 sql, (object)ToDynamicParameters(parameters),
                 transaction: tx, commandTimeout: CommandTimeout, cancellationToken: ct)).ConfigureAwait(false);
+        }
+
+        /// <summary>
+        /// Throws <see cref="ConcurrencyException"/> if a versioned UPDATE affected no rows,
+        /// indicating the row was changed or deleted by another process since it was loaded.
+        /// </summary>
+        private static void CheckConcurrency(EntityMapping mapping, object entity, int affectedRows)
+        {
+            if (affectedRows == 0 && mapping.VersionColumns != null && mapping.VersionColumns.Count > 0)
+                throw new ConcurrencyException(entity, mapping.EntityType);
         }
 
         #endregion

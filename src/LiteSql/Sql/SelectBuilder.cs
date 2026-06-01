@@ -1,3 +1,4 @@
+using LiteSql.Dialects;
 using LiteSql.Mapping;
 using System;
 using System.Collections.Generic;
@@ -17,10 +18,12 @@ namespace LiteSql.Sql
     public class SelectBuilder
     {
         private readonly EntityMapping _mapping;
+        private readonly ISqlDialect _dialect;
 
-        public SelectBuilder(EntityMapping mapping)
+        public SelectBuilder(EntityMapping mapping, ISqlDialect dialect = null)
         {
             _mapping = mapping ?? throw new ArgumentNullException(nameof(mapping));
+            _dialect = dialect ?? SqlGenerator.DefaultDialect;
         }
 
         /// <summary>
@@ -39,8 +42,8 @@ namespace LiteSql.Sql
 
             return string.Join(", ", columns.Select(c =>
                 c.Alias != null && c.Alias != c.ColumnName
-                    ? $"[{c.ColumnName}] AS [{c.Alias}]"
-                    : $"[{c.ColumnName}]"));
+                    ? $"{_dialect.QuoteIdentifier(c.ColumnName)} AS {_dialect.QuoteIdentifier(c.Alias)}"
+                    : $"{_dialect.QuoteIdentifier(c.ColumnName)}"));
         }
 
         private List<SelectColumn> ExtractColumns(Expression body)

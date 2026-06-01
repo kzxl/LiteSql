@@ -181,15 +181,16 @@ namespace LiteSql.Sql
             {
                 var column = Visit(method.Object);
                 var arg = EvaluateExpression(method.Arguments[0]);
+                var escaped = EscapeLike(arg);
 
                 switch (method.Method.Name)
                 {
                     case "Contains":
-                        return $"{column} LIKE {AddParameter($"%{arg}%")}";
+                        return $"{column} LIKE {AddParameter($"%{escaped}%")} ESCAPE '\\'";
                     case "StartsWith":
-                        return $"{column} LIKE {AddParameter($"{arg}%")}";
+                        return $"{column} LIKE {AddParameter($"{escaped}%")} ESCAPE '\\'";
                     case "EndsWith":
-                        return $"{column} LIKE {AddParameter($"%{arg}")}";
+                        return $"{column} LIKE {AddParameter($"%{escaped}")} ESCAPE '\\'";
                 }
             }
 
@@ -277,6 +278,19 @@ namespace LiteSql.Sql
             var paramName = $"@{_paramPrefix}{_paramIndex++}";
             _parameters[paramName] = value;
             return paramName;
+        }
+
+        /// <summary>
+        /// Escapes LIKE wildcard characters (%, _) and the escape char (\) in user input,
+        /// so they are matched literally. Paired with an "ESCAPE '\\'" clause.
+        /// </summary>
+        private static string EscapeLike(object value)
+        {
+            if (value == null) return null;
+            return value.ToString()
+                .Replace("\\", "\\\\")
+                .Replace("%", "\\%")
+                .Replace("_", "\\_");
         }
 
         /// <summary>

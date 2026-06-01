@@ -29,49 +29,164 @@ namespace LiteSql.Sql
         }
 
         /// <summary>
-        /// Builds a complete JOIN SQL query.
+        /// Builds a complete JOIN SQL query with optional WHERE predicates over both entities.
         /// </summary>
         public (string Sql, IDictionary<string, object> Parameters) BuildJoinQuery<T1, T2, TResult>(
             Expression<Func<T1, object>> outerKeySelector,
             Expression<Func<T2, object>> innerKeySelector,
             Expression<Func<T1, T2, TResult>> resultSelector,
             JoinType joinType,
-            string whereClause,
-            IDictionary<string, object> whereParameters)
+            IReadOnlyList<Expression<Func<T1, T2, bool>>> wherePredicates)
         {
             _parameters.Clear();
             _paramIndex = 0;
 
-            // Copy WHERE parameters if present
-            if (whereParameters != null)
-            {
-                foreach (var kvp in whereParameters)
-                    _parameters[kvp.Key] = kvp.Value;
-            }
-
-            // Extract join keys
             var outerKey = ExtractColumnName(outerKeySelector.Body, _mapping1);
             var innerKey = ExtractColumnName(innerKeySelector.Body, _mapping2);
-
-            // Build SELECT clause from result selector
             var selectClause = BuildSelectClause(resultSelector);
 
-            // Build JOIN clause
             var joinKeyword = joinType == JoinType.Inner ? "INNER JOIN" : "LEFT JOIN";
             var table1 = SqlGenerator.QuoteTableName(_mapping1.TableName, _dialect);
             var table2 = SqlGenerator.QuoteTableName(_mapping2.TableName, _dialect);
             var joinClause = $"{joinKeyword} {table2} AS t2 ON t1.{_dialect.QuoteIdentifier(outerKey)} = t2.{_dialect.QuoteIdentifier(innerKey)}";
 
-            // Combine all parts
             var sql = new StringBuilder();
             sql.Append($"SELECT {selectClause}");
             sql.Append($" FROM {table1} AS t1");
             sql.Append($" {joinClause}");
 
-            if (!string.IsNullOrEmpty(whereClause))
-                sql.Append($" WHERE {whereClause}");
+            if (wherePredicates != null && wherePredicates.Count > 0)
+            {
+                var clauses = new List<string>();
+                foreach (var predicate in wherePredicates)
+                    clauses.Add(VisitJoinWhere(predicate.Body, predicate.Parameters[0], predicate.Parameters[1]));
+                sql.Append($" WHERE {string.Join(" AND ", clauses)}");
+            }
 
             return (sql.ToString(), _parameters);
+        }
+
+        /// <summary>
+        /// Translates a WHERE predicate referencing both joined entities into aliased SQL.
+        /// </summary>
+        private string VisitJoinWhere(Expression expr, ParameterExpression p1, ParameterExpression p2)
+        {
+            switch (expr)
+            {
+                case UnaryExpression unary when unary.NodeType == ExpressionType.Convert:
+                    return VisitJoinWhere(unary.Operand, p1, p2);
+
+                case UnaryExpression unary when unary.NodeType == ExpressionType.Not:
+                    return $"NOT ({VisitJoinWhere(unary.Operand, p1, p2)})";
+
+                case BinaryExpression binary:
+                    return VisitJoinWhereBinary(binary, p1, p2);
+
+                case MemberExpression member when IsEntityMember(member, p1, p2):
+                    return TranslateSelectArgument(member, p1, p2);
+
+                case MethodCallExpression method:
+                    return VisitJoinWhereMethod(method, p1, p2);
+
+                case ConstantExpression constant:
+                    return constant.Value == null ? "NULL" : AddParameter(constant.Value);
+
+                default:
+                    return AddParameter(EvaluateJoinValue(expr));
+            }
+        }
+
+        private string VisitJoinWhereBinary(BinaryExpression binary, ParameterExpression p1, ParameterExpression p2)
+        {
+            // null comparison handling
+            if ((binary.NodeType == ExpressionType.Equal || binary.NodeType == ExpressionType.NotEqual))
+            {
+                Expression memberSide = null;
+                if (IsNull(binary.Right)) memberSide = binary.Left;
+                else if (IsNull(binary.Left)) memberSide = binary.Right;
+                if (memberSide != null)
+                {
+                    var col = VisitJoinWhere(memberSide, p1, p2);
+                    return binary.NodeType == ExpressionType.Equal ? $"{col} IS NULL" : $"{col} IS NOT NULL";
+                }
+            }
+
+            var left = VisitJoinWhere(binary.Left, p1, p2);
+            var right = VisitJoinWhere(binary.Right, p1, p2);
+
+            string op;
+            switch (binary.NodeType)
+            {
+                case ExpressionType.Equal: op = "="; break;
+                case ExpressionType.NotEqual: op = "<>"; break;
+                case ExpressionType.LessThan: op = "<"; break;
+                case ExpressionType.LessThanOrEqual: op = "<="; break;
+                case ExpressionType.GreaterThan: op = ">"; break;
+                case ExpressionType.GreaterThanOrEqual: op = ">="; break;
+                case ExpressionType.AndAlso: op = "AND"; break;
+                case ExpressionType.OrElse: op = "OR"; break;
+                default:
+                    throw new NotSupportedException($"Binary operator '{binary.NodeType}' is not supported in join WHERE.");
+            }
+
+            if (binary.NodeType == ExpressionType.AndAlso || binary.NodeType == ExpressionType.OrElse)
+                return $"({left} {op} {right})";
+            return $"{left} {op} {right}";
+        }
+
+        private string VisitJoinWhereMethod(MethodCallExpression method, ParameterExpression p1, ParameterExpression p2)
+        {
+            if (method.Object != null && method.Object.Type == typeof(string)
+                && IsEntityMember(method.Object as MemberExpression, p1, p2))
+            {
+                var column = VisitJoinWhere(method.Object, p1, p2);
+                var arg = EvaluateJoinValue(method.Arguments[0]);
+                switch (method.Method.Name)
+                {
+                    case "Contains": return $"{column} LIKE {AddParameter($"%{Escape(arg)}%")} ESCAPE '\\'";
+                    case "StartsWith": return $"{column} LIKE {AddParameter($"{Escape(arg)}%")} ESCAPE '\\'";
+                    case "EndsWith": return $"{column} LIKE {AddParameter($"%{Escape(arg)}")} ESCAPE '\\'";
+                }
+            }
+            return AddParameter(EvaluateJoinValue(method));
+        }
+
+        private bool IsEntityMember(MemberExpression member, ParameterExpression p1, ParameterExpression p2)
+        {
+            return member != null && member.Expression is ParameterExpression pe
+                && (pe.Name == p1.Name || pe.Name == p2.Name);
+        }
+
+        private static bool IsNull(Expression expr)
+        {
+            if (expr is ConstantExpression c && c.Value == null) return true;
+            if (expr is UnaryExpression u && u.NodeType == ExpressionType.Convert) return IsNull(u.Operand);
+            return false;
+        }
+
+        private static string Escape(object value)
+        {
+            if (value == null) return null;
+            return value.ToString()
+                .Replace("\\", "\\\\")
+                .Replace("%", "\\%")
+                .Replace("_", "\\_");
+        }
+
+        private static object EvaluateJoinValue(Expression expr)
+        {
+            if (expr is ConstantExpression c) return c.Value;
+            if (expr is UnaryExpression u && u.NodeType == ExpressionType.Convert)
+                return EvaluateJoinValue(u.Operand);
+            var lambda = Expression.Lambda<Func<object>>(Expression.Convert(expr, typeof(object)));
+            return ExpressionCache.GetOrAddFunc<object>(lambda)();
+        }
+
+        private string AddParameter(object value)
+        {
+            var name = $"@j{_paramIndex++}";
+            _parameters[name] = value;
+            return name;
         }
 
         /// <summary>

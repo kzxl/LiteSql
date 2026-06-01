@@ -16,22 +16,27 @@ namespace LiteSql.Sql
     /// </summary>
     public static class SqlGenerator
     {
-        // OPT-2: SQL template caches per entity type
-        private static readonly ConcurrentDictionary<Type, string> _insertSqlCache = new ConcurrentDictionary<Type, string>();
-        private static readonly ConcurrentDictionary<Type, string> _deleteSqlCache = new ConcurrentDictionary<Type, string>();
-        private static readonly ConcurrentDictionary<Type, string> _selectAllCache = new ConcurrentDictionary<Type, string>();
+        // OPT-2: SQL template caches per entity type (keyed by type + dialect provider)
+        private static readonly ConcurrentDictionary<string, string> _insertSqlCache = new ConcurrentDictionary<string, string>();
+        private static readonly ConcurrentDictionary<string, string> _deleteSqlCache = new ConcurrentDictionary<string, string>();
+        private static readonly ConcurrentDictionary<string, string> _selectAllCache = new ConcurrentDictionary<string, string>();
 
         /// <summary>
         /// Default SQL dialect used when none is specified. Defaults to SQL Server.
         /// </summary>
         public static ISqlDialect DefaultDialect { get; set; } = new SqlServerDialect();
+
+        private static string CacheKey(Type type, ISqlDialect dialect)
+            => type.FullName + "::" + (dialect ?? DefaultDialect).ProviderName;
+
         /// <summary>
-        /// Generates a SELECT * statement for the entity type.
+        /// Generates a SELECT * statement for the entity type using the specified dialect.
         /// </summary>
-        public static string GenerateSelectAll(EntityMapping mapping)
+        public static string GenerateSelectAll(EntityMapping mapping, ISqlDialect dialect = null)
         {
-            return _selectAllCache.GetOrAdd(mapping.EntityType,
-                _ => $"SELECT * FROM {QuoteTableName(mapping.TableName)}");
+            var d = dialect ?? DefaultDialect;
+            return _selectAllCache.GetOrAdd(CacheKey(mapping.EntityType, d),
+                _ => $"SELECT * FROM {QuoteTableName(mapping.TableName, d)}");
         }
 
         /// <summary>
@@ -42,12 +47,22 @@ namespace LiteSql.Sql
         public static (string Sql, IDictionary<string, object> Parameters) GenerateInsert(
             EntityMapping mapping, object entity)
         {
-            var sql = _insertSqlCache.GetOrAdd(mapping.EntityType, _ =>
+            return GenerateInsert(mapping, entity, DefaultDialect);
+        }
+
+        /// <summary>
+        /// Generates a parameterized INSERT statement using the specified dialect.
+        /// </summary>
+        public static (string Sql, IDictionary<string, object> Parameters) GenerateInsert(
+            EntityMapping mapping, object entity, ISqlDialect dialect)
+        {
+            var d = dialect ?? DefaultDialect;
+            var sql = _insertSqlCache.GetOrAdd(CacheKey(mapping.EntityType, d), _ =>
             {
                 var columns = mapping.InsertableColumns;
-                var columnNames = columns.Select(c => QuoteIdentifier(c.ColumnName));
+                var columnNames = columns.Select(c => QuoteIdentifier(c.ColumnName, d));
                 var paramNames = columns.Select(c => $"@{c.ColumnName}");
-                return $"INSERT INTO {QuoteTableName(mapping.TableName)} ({string.Join(", ", columnNames)}) " +
+                return $"INSERT INTO {QuoteTableName(mapping.TableName, d)} ({string.Join(", ", columnNames)}) " +
                        $"VALUES ({string.Join(", ", paramNames)})";
             });
 
@@ -62,6 +77,16 @@ namespace LiteSql.Sql
         public static (string Sql, IDictionary<string, object> Parameters) GenerateDelete(
             EntityMapping mapping, object entity)
         {
+            return GenerateDelete(mapping, entity, DefaultDialect);
+        }
+
+        /// <summary>
+        /// Generates a parameterized DELETE (or soft-delete UPDATE) using the specified dialect.
+        /// </summary>
+        public static (string Sql, IDictionary<string, object> Parameters) GenerateDelete(
+            EntityMapping mapping, object entity, ISqlDialect dialect)
+        {
+            var d = dialect ?? DefaultDialect;
             if (mapping.PrimaryKeys.Count == 0)
                 throw new InvalidOperationException(
                     $"Cannot generate DELETE for '{mapping.EntityType.Name}': no primary key defined.");
@@ -74,17 +99,18 @@ namespace LiteSql.Sql
             string sqlTemplate;
             if (softDelete != null)
             {
-                // Soft delete: UPDATE SET {Column} = 1 WHERE PK = @pk
-                var pkClauses = mapping.PrimaryKeys.Select(pk => $"{QuoteIdentifier(pk.ColumnName)} = @pk_{pk.ColumnName}");
-                sqlTemplate = $"UPDATE {QuoteTableName(mapping.TableName)} SET {QuoteIdentifier(softDelete.ColumnName)} = 1 " +
+                // Soft delete: UPDATE SET {Column} = <true> WHERE PK = @pk
+                var trueLiteral = d.ProviderName == "PostgreSQL" ? "TRUE" : "1";
+                var pkClauses = mapping.PrimaryKeys.Select(pk => $"{QuoteIdentifier(pk.ColumnName, d)} = @pk_{pk.ColumnName}");
+                sqlTemplate = $"UPDATE {QuoteTableName(mapping.TableName, d)} SET {QuoteIdentifier(softDelete.ColumnName, d)} = {trueLiteral} " +
                               $"WHERE {string.Join(" AND ", pkClauses)}";
             }
             else
             {
-                sqlTemplate = _deleteSqlCache.GetOrAdd(mapping.EntityType, _ =>
+                sqlTemplate = _deleteSqlCache.GetOrAdd(CacheKey(mapping.EntityType, d), _ =>
                 {
-                    var pkClauses = mapping.PrimaryKeys.Select(pk => $"{QuoteIdentifier(pk.ColumnName)} = @pk_{pk.ColumnName}");
-                    return $"DELETE FROM {QuoteTableName(mapping.TableName)} WHERE {string.Join(" AND ", pkClauses)}";
+                    var pkClauses = mapping.PrimaryKeys.Select(pk => $"{QuoteIdentifier(pk.ColumnName, d)} = @pk_{pk.ColumnName}");
+                    return $"DELETE FROM {QuoteTableName(mapping.TableName, d)} WHERE {string.Join(" AND ", pkClauses)}";
                 });
             }
 
@@ -102,6 +128,16 @@ namespace LiteSql.Sql
         public static (string Sql, IDictionary<string, object> Parameters) GenerateUpdate(
             EntityMapping mapping, object entity)
         {
+            return GenerateUpdate(mapping, entity, DefaultDialect);
+        }
+
+        /// <summary>
+        /// Generates a parameterized UPDATE statement using the specified dialect.
+        /// </summary>
+        public static (string Sql, IDictionary<string, object> Parameters) GenerateUpdate(
+            EntityMapping mapping, object entity, ISqlDialect dialect)
+        {
+            var d = dialect ?? DefaultDialect;
             if (mapping.PrimaryKeys.Count == 0)
                 throw new InvalidOperationException(
                     $"Cannot generate UPDATE for '{mapping.EntityType.Name}': no primary key defined.");
@@ -111,13 +147,10 @@ namespace LiteSql.Sql
                     $"Cannot generate UPDATE for '{mapping.EntityType.Name}': no updatable columns.");
 
             var setClauses = mapping.UpdatableColumns
-                .Select(c => $"{QuoteIdentifier(c.ColumnName)} = @{c.ColumnName}");
+                .Select(c => $"{QuoteIdentifier(c.ColumnName, d)} = @{c.ColumnName}")
+                .ToList();
 
-            var whereClause = BuildWhereByPrimaryKeys(mapping, entity, out var whereParams);
-
-            var sql = $"UPDATE {QuoteTableName(mapping.TableName)} " +
-                      $"SET {string.Join(", ", setClauses)} " +
-                      $"WHERE {whereClause}";
+            var whereClause = BuildWhereByPrimaryKeys(mapping, entity, d, out var whereParams);
 
             // Merge SET parameters with WHERE parameters
             var allParams = BuildParameters(mapping.UpdatableColumns, entity);
@@ -125,6 +158,13 @@ namespace LiteSql.Sql
             {
                 allParams[kv.Key] = kv.Value;
             }
+
+            // Optimistic concurrency: add version check to WHERE and bump integer versions.
+            whereClause = ApplyVersionConcurrency(mapping, entity, d, setClauses, allParams, whereClause);
+
+            var sql = $"UPDATE {QuoteTableName(mapping.TableName, d)} " +
+                      $"SET {string.Join(", ", setClauses)} " +
+                      $"WHERE {whereClause}";
 
             return (sql, allParams);
         }
@@ -136,6 +176,16 @@ namespace LiteSql.Sql
         public static (string Sql, IDictionary<string, object> Parameters) GeneratePartialUpdate(
             EntityMapping mapping, object entity, IReadOnlyList<string> changedProperties)
         {
+            return GeneratePartialUpdate(mapping, entity, changedProperties, DefaultDialect);
+        }
+
+        /// <summary>
+        /// Generates a partial UPDATE statement using the specified dialect.
+        /// </summary>
+        public static (string Sql, IDictionary<string, object> Parameters) GeneratePartialUpdate(
+            EntityMapping mapping, object entity, IReadOnlyList<string> changedProperties, ISqlDialect dialect)
+        {
+            var d = dialect ?? DefaultDialect;
             if (mapping.PrimaryKeys.Count == 0)
                 throw new InvalidOperationException(
                     $"Cannot generate UPDATE for '{mapping.EntityType.Name}': no primary key defined.");
@@ -148,16 +198,19 @@ namespace LiteSql.Sql
             if (changedColumns.Count == 0)
                 return (null, null); // No changes to persist
 
-            var setClauses = changedColumns.Select(c => $"{QuoteIdentifier(c.ColumnName)} = @{c.ColumnName}");
-            var whereClause = BuildWhereByPrimaryKeys(mapping, entity, out var whereParams);
-
-            var sql = $"UPDATE {QuoteTableName(mapping.TableName)} " +
-                      $"SET {string.Join(", ", setClauses)} " +
-                      $"WHERE {whereClause}";
+            var setClauses = changedColumns.Select(c => $"{QuoteIdentifier(c.ColumnName, d)} = @{c.ColumnName}").ToList();
+            var whereClause = BuildWhereByPrimaryKeys(mapping, entity, d, out var whereParams);
 
             var allParams = BuildParameters(changedColumns, entity);
             foreach (var kv in whereParams)
                 allParams[kv.Key] = kv.Value;
+
+            // Optimistic concurrency: add version check to WHERE and bump integer versions.
+            whereClause = ApplyVersionConcurrency(mapping, entity, d, setClauses, allParams, whereClause);
+
+            var sql = $"UPDATE {QuoteTableName(mapping.TableName, d)} " +
+                      $"SET {string.Join(", ", setClauses)} " +
+                      $"WHERE {whereClause}";
 
             return (sql, allParams);
         }
@@ -185,19 +238,55 @@ namespace LiteSql.Sql
         #region Private Helpers
 
         private static string BuildWhereByPrimaryKeys(
-            EntityMapping mapping, object entity, out IDictionary<string, object> parameters)
+            EntityMapping mapping, object entity, ISqlDialect dialect, out IDictionary<string, object> parameters)
         {
+            var d = dialect ?? DefaultDialect;
             parameters = new Dictionary<string, object>();
             var clauses = new List<string>();
 
             foreach (var pk in mapping.PrimaryKeys)
             {
                 var paramName = $"@pk_{pk.ColumnName}";
-                clauses.Add($"{QuoteIdentifier(pk.ColumnName)} = {paramName}");
+                clauses.Add($"{QuoteIdentifier(pk.ColumnName, d)} = {paramName}");
                 parameters[paramName] = pk.Property.GetValue(entity);
             }
 
             return string.Join(" AND ", clauses);
+        }
+
+        /// <summary>
+        /// Applies optimistic concurrency: appends "version = @version_original" to the WHERE,
+        /// and for integral version columns adds "version = version + 1" to the SET list so the
+        /// value advances on each successful update. No-op when the entity has no version columns.
+        /// </summary>
+        private static string ApplyVersionConcurrency(
+            EntityMapping mapping, object entity, ISqlDialect d,
+            List<string> setClauses, IDictionary<string, object> allParams, string whereClause)
+        {
+            if (mapping.VersionColumns == null || mapping.VersionColumns.Count == 0)
+                return whereClause;
+
+            var extra = new List<string>();
+            foreach (var ver in mapping.VersionColumns)
+            {
+                var quoted = QuoteIdentifier(ver.ColumnName, d);
+                var origParam = $"@ver_{ver.ColumnName}";
+                allParams[origParam] = ver.Property.GetValue(entity);
+                extra.Add($"{quoted} = {origParam}");
+
+                // For integral version columns, increment in place (rowversion/timestamp is DB-managed).
+                var verType = Nullable.GetUnderlyingType(ver.Property.PropertyType) ?? ver.Property.PropertyType;
+                if (verType == typeof(int) || verType == typeof(long) || verType == typeof(short))
+                {
+                    // Replace any existing SET for this column, then add the increment.
+                    setClauses.RemoveAll(s => s.StartsWith($"{quoted} =", StringComparison.Ordinal));
+                    setClauses.Add($"{quoted} = {quoted} + 1");
+                }
+            }
+
+            return string.IsNullOrEmpty(whereClause)
+                ? string.Join(" AND ", extra)
+                : whereClause + " AND " + string.Join(" AND ", extra);
         }
 
         private static IDictionary<string, object> BuildParameters(
@@ -213,12 +302,23 @@ namespace LiteSql.Sql
 
         /// <summary>
         /// Generates an UPSERT (INSERT OR UPDATE) SQL statement.
-        /// SQLite: INSERT OR REPLACE INTO ...
-        /// SQL Server: MERGE ... WHEN MATCHED THEN UPDATE WHEN NOT MATCHED THEN INSERT
+        /// SQLite: INSERT OR REPLACE. SQL Server: MERGE.
+        /// MySQL: INSERT ... ON DUPLICATE KEY UPDATE. PostgreSQL: INSERT ... ON CONFLICT.
+        /// Legacy bool overload — kept for backward compatibility.
         /// </summary>
         public static (string sql, IDictionary<string, object> parameters)? GenerateUpsert(
             EntityMapping mapping, object entity, bool isSqlite = true)
         {
+            return GenerateUpsert(mapping, entity, isSqlite ? (ISqlDialect)new SqliteDialect() : new SqlServerDialect());
+        }
+
+        /// <summary>
+        /// Generates a dialect-specific UPSERT statement.
+        /// </summary>
+        public static (string sql, IDictionary<string, object> parameters)? GenerateUpsert(
+            EntityMapping mapping, object entity, ISqlDialect dialect)
+        {
+            var d = dialect ?? DefaultDialect;
             if (mapping.PrimaryKeys.Count == 0) return null;
 
             var allCols = mapping.Columns.Where(c => !c.IsDbGenerated).ToList();
@@ -232,31 +332,73 @@ namespace LiteSql.Sql
                     parameters[pkParam] = pk.Property.GetValue(entity);
             }
 
-            if (isSqlite)
-            {
-                // SQLite: INSERT OR REPLACE INTO table (cols) VALUES (vals)
-                var columnNames = allCols.Select(c => QuoteIdentifier(c.ColumnName));
-                var paramNames = allCols.Select(c => $"@{c.ColumnName}");
-                var sql = $"INSERT OR REPLACE INTO {QuoteTableName(mapping.TableName)} " +
-                          $"({string.Join(", ", columnNames)}) VALUES ({string.Join(", ", paramNames)})";
-                return (sql, parameters);
-            }
-            else
-            {
-                // SQL Server: MERGE
-                var onClause = string.Join(" AND ",
-                    mapping.PrimaryKeys.Select(pk => $"T.{QuoteIdentifier(pk.ColumnName)} = S.{QuoteIdentifier(pk.ColumnName)}"));
-                var updateCols = allCols.Where(c => !c.IsPrimaryKey).ToList();
-                var setClauses = updateCols.Select(c => $"T.{QuoteIdentifier(c.ColumnName)} = @{c.ColumnName}");
-                var insertCols = allCols.Select(c => QuoteIdentifier(c.ColumnName));
-                var insertVals = allCols.Select(c => $"@{c.ColumnName}");
+            var table = QuoteTableName(mapping.TableName, d);
+            var columnNames = allCols.Select(c => QuoteIdentifier(c.ColumnName, d)).ToList();
+            var paramNames = allCols.Select(c => $"@{c.ColumnName}").ToList();
+            var updateCols = allCols.Where(c => !c.IsPrimaryKey).ToList();
 
-                var sql = $"MERGE {QuoteTableName(mapping.TableName)} AS T " +
-                          $"USING (SELECT {string.Join(", ", mapping.PrimaryKeys.Select(pk => $"@pk_{pk.ColumnName} AS {QuoteIdentifier(pk.ColumnName)}"))}) AS S " +
-                          $"ON {onClause} " +
-                          $"WHEN MATCHED THEN UPDATE SET {string.Join(", ", setClauses)} " +
-                          $"WHEN NOT MATCHED THEN INSERT ({string.Join(", ", insertCols)}) VALUES ({string.Join(", ", insertVals)});";
-                return (sql, parameters);
+            switch (d.ProviderName)
+            {
+                case "SQLite":
+                {
+                    var sql = $"INSERT OR REPLACE INTO {table} " +
+                              $"({string.Join(", ", columnNames)}) VALUES ({string.Join(", ", paramNames)})";
+                    return (sql, parameters);
+                }
+
+                case "MySQL":
+                {
+                    // INSERT ... ON DUPLICATE KEY UPDATE col = VALUES(col)
+                    var setClauses = updateCols.Count > 0
+                        ? updateCols.Select(c => $"{QuoteIdentifier(c.ColumnName, d)} = VALUES({QuoteIdentifier(c.ColumnName, d)})")
+                        : mapping.PrimaryKeys.Select(pk => $"{QuoteIdentifier(pk.ColumnName, d)} = {QuoteIdentifier(pk.ColumnName, d)}");
+                    var sql = $"INSERT INTO {table} ({string.Join(", ", columnNames)}) " +
+                              $"VALUES ({string.Join(", ", paramNames)}) " +
+                              $"ON DUPLICATE KEY UPDATE {string.Join(", ", setClauses)}";
+                    return (sql, parameters);
+                }
+
+                case "PostgreSQL":
+                {
+                    // INSERT ... ON CONFLICT (pk) DO UPDATE SET col = EXCLUDED.col
+                    var conflictCols = string.Join(", ", mapping.PrimaryKeys.Select(pk => QuoteIdentifier(pk.ColumnName, d)));
+                    string sql;
+                    if (updateCols.Count > 0)
+                    {
+                        var setClauses = updateCols.Select(c => $"{QuoteIdentifier(c.ColumnName, d)} = EXCLUDED.{QuoteIdentifier(c.ColumnName, d)}");
+                        sql = $"INSERT INTO {table} ({string.Join(", ", columnNames)}) " +
+                              $"VALUES ({string.Join(", ", paramNames)}) " +
+                              $"ON CONFLICT ({conflictCols}) DO UPDATE SET {string.Join(", ", setClauses)}";
+                    }
+                    else
+                    {
+                        sql = $"INSERT INTO {table} ({string.Join(", ", columnNames)}) " +
+                              $"VALUES ({string.Join(", ", paramNames)}) " +
+                              $"ON CONFLICT ({conflictCols}) DO NOTHING";
+                    }
+                    return (sql, parameters);
+                }
+
+                default:
+                {
+                    // SQL Server: MERGE
+                    var onClause = string.Join(" AND ",
+                        mapping.PrimaryKeys.Select(pk => $"T.{QuoteIdentifier(pk.ColumnName, d)} = S.{QuoteIdentifier(pk.ColumnName, d)}"));
+                    var setClauses = updateCols.Select(c => $"T.{QuoteIdentifier(c.ColumnName, d)} = @{c.ColumnName}");
+                    var insertCols = allCols.Select(c => QuoteIdentifier(c.ColumnName, d));
+                    var insertVals = allCols.Select(c => $"@{c.ColumnName}");
+
+                    var matchedClause = updateCols.Count > 0
+                        ? $"WHEN MATCHED THEN UPDATE SET {string.Join(", ", setClauses)} "
+                        : "";
+
+                    var sql = $"MERGE {table} AS T " +
+                              $"USING (SELECT {string.Join(", ", mapping.PrimaryKeys.Select(pk => $"@pk_{pk.ColumnName} AS {QuoteIdentifier(pk.ColumnName, d)}"))}) AS S " +
+                              $"ON {onClause} " +
+                              matchedClause +
+                              $"WHEN NOT MATCHED THEN INSERT ({string.Join(", ", insertCols)}) VALUES ({string.Join(", ", insertVals)});";
+                    return (sql, parameters);
+                }
             }
         }
 

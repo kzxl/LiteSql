@@ -27,6 +27,12 @@ namespace LiteSql
         private List<string> _orderByClauses;
         private int? _skip;
         private int? _take;
+        // Deferred predicates accumulated via WhereIf/AndWhere before a terminal operation.
+        private List<Expression<Func<T, bool>>> _pendingPredicates;
+        // Raw WHERE fragments (e.g. EXISTS / IN subqueries) accumulated before a terminal operation.
+        private List<(string Sql, IDictionary<string, object> Parameters)> _rawWhereFragments;
+        private int _subqueryAliasSeq;
+        private int _subqueryParamSeed;
 
         internal Table(LiteContext context, ChangeTracker changeTracker)
         {
@@ -37,6 +43,66 @@ namespace LiteSql
         // Internal properties for Join support
         internal System.Data.IDbConnection Connection => _context.Connection;
         internal System.Data.IDbTransaction Transaction => _context.Transaction;
+        internal LiteContext Context => _context;
+        internal LiteSql.Dialects.ISqlDialect Dialect => _context.Dialect;
+
+        /// <summary>
+        /// Records a predicate to be combined (AND) with the next terminal query operation.
+        /// Used by WhereIf and AndWhere for deferred, accumulated filtering.
+        /// </summary>
+        internal void AddPendingPredicate(Expression<Func<T, bool>> predicate)
+        {
+            if (predicate == null) return;
+            if (_pendingPredicates == null)
+                _pendingPredicates = new List<Expression<Func<T, bool>>>();
+            _pendingPredicates.Add(predicate);
+        }
+
+        /// <summary>
+        /// Combines all accumulated pending predicates with the supplied predicate using AND.
+        /// Returns null if there is nothing to filter on.
+        /// </summary>
+        private Expression<Func<T, bool>> CombinePending(Expression<Func<T, bool>> predicate)
+        {
+            var all = new List<Expression<Func<T, bool>>>();
+            if (_pendingPredicates != null) all.AddRange(_pendingPredicates);
+            if (predicate != null) all.Add(predicate);
+            if (all.Count == 0) return null;
+
+            var combined = all[0];
+            for (int i = 1; i < all.Count; i++)
+                combined = AndAlso(combined, all[i]);
+            return combined;
+        }
+
+        /// <summary>
+        /// Builds a new lambda that ANDs two predicates over a shared parameter.
+        /// </summary>
+        private static Expression<Func<T, bool>> AndAlso(
+            Expression<Func<T, bool>> left, Expression<Func<T, bool>> right)
+        {
+            var param = Expression.Parameter(typeof(T), "x");
+            var leftBody = new ParameterRebinder(left.Parameters[0], param).Visit(left.Body);
+            var rightBody = new ParameterRebinder(right.Parameters[0], param).Visit(right.Body);
+            return Expression.Lambda<Func<T, bool>>(
+                Expression.AndAlso(leftBody, rightBody), param);
+        }
+
+        /// <summary>
+        /// Rewrites a lambda body to use a replacement parameter so two lambdas can be merged.
+        /// </summary>
+        private sealed class ParameterRebinder : ExpressionVisitor
+        {
+            private readonly ParameterExpression _from;
+            private readonly ParameterExpression _to;
+            public ParameterRebinder(ParameterExpression from, ParameterExpression to)
+            {
+                _from = from;
+                _to = to;
+            }
+            protected override Expression VisitParameter(ParameterExpression node)
+                => node == _from ? _to : base.VisitParameter(node);
+        }
 
         #region Insert / Delete / Attach
 
@@ -122,7 +188,7 @@ namespace LiteSql
         public Table<T> OrderBy<TKey>(Expression<Func<T, TKey>> keySelector)
         {
             _orderByClauses = new List<string>();
-            _orderByClauses.Add($"[{ExtractColumnName(keySelector)}] ASC");
+            _orderByClauses.Add($"{_context.Dialect.QuoteIdentifier(ExtractColumnName(keySelector))} ASC");
             return this;
         }
 
@@ -132,7 +198,7 @@ namespace LiteSql
         public Table<T> OrderByDescending<TKey>(Expression<Func<T, TKey>> keySelector)
         {
             _orderByClauses = new List<string>();
-            _orderByClauses.Add($"[{ExtractColumnName(keySelector)}] DESC");
+            _orderByClauses.Add($"{_context.Dialect.QuoteIdentifier(ExtractColumnName(keySelector))} DESC");
             return this;
         }
 
@@ -143,7 +209,7 @@ namespace LiteSql
         {
             if (_orderByClauses == null)
                 throw new InvalidOperationException("ThenBy must be called after OrderBy or OrderByDescending.");
-            _orderByClauses.Add($"[{ExtractColumnName(keySelector)}] ASC");
+            _orderByClauses.Add($"{_context.Dialect.QuoteIdentifier(ExtractColumnName(keySelector))} ASC");
             return this;
         }
 
@@ -154,7 +220,7 @@ namespace LiteSql
         {
             if (_orderByClauses == null)
                 throw new InvalidOperationException("ThenByDescending must be called after OrderBy or OrderByDescending.");
-            _orderByClauses.Add($"[{ExtractColumnName(keySelector)}] DESC");
+            _orderByClauses.Add($"{_context.Dialect.QuoteIdentifier(ExtractColumnName(keySelector))} DESC");
             return this;
         }
 
@@ -195,14 +261,48 @@ namespace LiteSql
                 throw new ArgumentNullException(nameof(keySelector));
 
             var mapping = MappingCache.GetMapping<T>();
-            var tableName = SqlGenerator.QuoteTableName(mapping.TableName);
+            var tableName = SqlGenerator.QuoteTableName(mapping.TableName, _context.Dialect);
 
-            // Capture current WHERE clause state if any filters exist
+            // Capture WHERE clause from accumulated predicates (Where/WhereIf/AndWhere) and global filters.
             string whereClause = null;
             IDictionary<string, object> whereParameters = null;
 
-            // Note: OrderBy/Skip/Take before GroupBy are not supported and will be ignored
-            // They should be applied after GroupBy if needed
+            var whereParts = new List<string>();
+            var allParams = new Dictionary<string, object>();
+
+            if (!_ignoreFilters && _context.Filters.HasFilters)
+            {
+                var filters = _context.Filters.GetFilters(typeof(T));
+                if (filters.Count > 0)
+                {
+                    var filterBuilder = new WhereBuilder(mapping, _context.Dialect);
+                    foreach (var filter in filters)
+                    {
+                        var (fSql, fParams) = filterBuilder.BuildFromLambda(filter);
+                        whereParts.Add(fSql);
+                        if (fParams != null)
+                            foreach (var kv in fParams) allParams[kv.Key] = kv.Value;
+                    }
+                }
+            }
+
+            var pending = CombinePending(null);
+            if (pending != null)
+            {
+                var builder = new WhereBuilder(mapping, _context.Dialect);
+                var (wSql, wParams) = builder.Build(pending);
+                whereParts.Add("(" + wSql + ")");
+                if (wParams != null)
+                    foreach (var kv in wParams) allParams[kv.Key] = kv.Value;
+            }
+
+            if (whereParts.Count > 0)
+            {
+                whereClause = string.Join(" AND ", whereParts);
+                whereParameters = allParams;
+            }
+
+            // Note: OrderBy/Skip/Take before GroupBy are ignored — apply them after GroupBy.
 
             return new GroupByQuery<T, TKey>(
                 _context,
@@ -210,7 +310,101 @@ namespace LiteSql
                 tableName,
                 keySelector,
                 whereClause,
-                whereParameters);
+                whereParameters,
+                _context.Dialect);
+        }
+
+        #endregion
+
+        #region Subqueries (EXISTS / IN)
+
+        /// <summary>
+        /// Adds a correlated EXISTS subquery to the WHERE clause (accumulated; combined with AND).
+        /// Example: db.Customers.WhereExists(db.Orders, (c, o) =&gt; o.CustomerId == c.Id).ToList()
+        /// </summary>
+        public Table<T> WhereExists<TSub>(Table<TSub> subTable,
+            Expression<Func<T, TSub, bool>> correlation) where TSub : class
+        {
+            AddExists(subTable, correlation, negate: false);
+            return this;
+        }
+
+        /// <summary>
+        /// Adds a correlated NOT EXISTS subquery to the WHERE clause.
+        /// </summary>
+        public Table<T> WhereNotExists<TSub>(Table<TSub> subTable,
+            Expression<Func<T, TSub, bool>> correlation) where TSub : class
+        {
+            AddExists(subTable, correlation, negate: true);
+            return this;
+        }
+
+        /// <summary>
+        /// Adds an IN subquery: outerKey IN (SELECT innerKey FROM sub [WHERE filter]).
+        /// Example: db.Customers.WhereIn(c =&gt; c.Id, db.Orders, o =&gt; o.CustomerId, o =&gt; o.Status == "Active")
+        /// </summary>
+        public Table<T> WhereIn<TSub, TKey>(
+            Expression<Func<T, TKey>> outerKey,
+            Table<TSub> subTable,
+            Expression<Func<TSub, TKey>> innerKey,
+            Expression<Func<TSub, bool>> innerFilter = null) where TSub : class
+        {
+            AddIn(outerKey, subTable, innerKey, innerFilter, negate: false);
+            return this;
+        }
+
+        /// <summary>
+        /// Adds a NOT IN subquery.
+        /// </summary>
+        public Table<T> WhereNotIn<TSub, TKey>(
+            Expression<Func<T, TKey>> outerKey,
+            Table<TSub> subTable,
+            Expression<Func<TSub, TKey>> innerKey,
+            Expression<Func<TSub, bool>> innerFilter = null) where TSub : class
+        {
+            AddIn(outerKey, subTable, innerKey, innerFilter, negate: true);
+            return this;
+        }
+
+        private void AddExists<TSub>(Table<TSub> subTable,
+            Expression<Func<T, TSub, bool>> correlation, bool negate) where TSub : class
+        {
+            if (subTable == null) throw new ArgumentNullException(nameof(subTable));
+            if (correlation == null) throw new ArgumentNullException(nameof(correlation));
+
+            var outerMapping = MappingCache.GetMapping<T>();
+            var innerMapping = MappingCache.GetMapping<TSub>();
+            var alias = $"sq{_subqueryAliasSeq++}";
+            var builder = new SubqueryBuilder(outerMapping, innerMapping, _context.Dialect, alias, _subqueryParamSeed);
+            var fragment = builder.BuildExists(correlation, negate);
+            _subqueryParamSeed = builder.NextParamIndex;
+            AddRawWhere(fragment);
+        }
+
+        private void AddIn<TSub, TKey>(
+            Expression<Func<T, TKey>> outerKey,
+            Table<TSub> subTable,
+            Expression<Func<TSub, TKey>> innerKey,
+            Expression<Func<TSub, bool>> innerFilter, bool negate) where TSub : class
+        {
+            if (subTable == null) throw new ArgumentNullException(nameof(subTable));
+            if (outerKey == null) throw new ArgumentNullException(nameof(outerKey));
+            if (innerKey == null) throw new ArgumentNullException(nameof(innerKey));
+
+            var outerMapping = MappingCache.GetMapping<T>();
+            var innerMapping = MappingCache.GetMapping<TSub>();
+            var alias = $"sq{_subqueryAliasSeq++}";
+            var builder = new SubqueryBuilder(outerMapping, innerMapping, _context.Dialect, alias, _subqueryParamSeed);
+            var fragment = builder.BuildIn(outerKey, innerKey, innerFilter, negate);
+            _subqueryParamSeed = builder.NextParamIndex;
+            AddRawWhere(fragment);
+        }
+
+        private void AddRawWhere((string Sql, IDictionary<string, object> Parameters) fragment)
+        {
+            if (_rawWhereFragments == null)
+                _rawWhereFragments = new List<(string, IDictionary<string, object>)>();
+            _rawWhereFragments.Add(fragment);
         }
 
         #endregion
@@ -243,10 +437,22 @@ namespace LiteSql
 
         /// <summary>
         /// Server-side WHERE using LINQ expression predicate.
+        /// Combines any predicates previously accumulated via WhereIf/AndWhere.
         /// </summary>
         public List<T> Where(Expression<Func<T, bool>> predicate)
         {
-            return ExecuteWhere(predicate);
+            return ExecuteWhere(CombinePending(predicate));
+        }
+
+        /// <summary>
+        /// Accumulates a predicate (combined with AND) without executing the query.
+        /// Chain with a terminal operation such as ToList()/FirstOrDefault().
+        /// Example: db.Orders.AndWhere(o =&gt; o.Active).AndWhere(o =&gt; o.Amount &gt; 100).ToList()
+        /// </summary>
+        public Table<T> AndWhere(Expression<Func<T, bool>> predicate)
+        {
+            AddPendingPredicate(predicate);
+            return this;
         }
 
         /// <summary>
@@ -255,7 +461,7 @@ namespace LiteSql
         public T FirstOrDefault(Expression<Func<T, bool>> predicate)
         {
             if (_take == null) _take = 1;
-            return ExecuteWhere(predicate).FirstOrDefault();
+            return ExecuteWhere(CombinePending(predicate)).FirstOrDefault();
         }
 
         /// <summary>
@@ -263,7 +469,7 @@ namespace LiteSql
         /// </summary>
         public T Single(Expression<Func<T, bool>> predicate)
         {
-            return ExecuteWhere(predicate).Single();
+            return ExecuteWhere(CombinePending(predicate)).Single();
         }
 
         /// <summary>
@@ -271,7 +477,7 @@ namespace LiteSql
         /// </summary>
         public T SingleOrDefault(Expression<Func<T, bool>> predicate)
         {
-            return ExecuteWhere(predicate).SingleOrDefault();
+            return ExecuteWhere(CombinePending(predicate)).SingleOrDefault();
         }
 
         /// <summary>
@@ -280,15 +486,18 @@ namespace LiteSql
         public T First(Expression<Func<T, bool>> predicate)
         {
             if (_take == null) _take = 1;
-            return ExecuteWhere(predicate).First();
+            return ExecuteWhere(CombinePending(predicate)).First();
         }
 
         /// <summary>
         /// Executes the current query and returns all matching rows as a List.
-        /// Respects OrderBy/Skip/Take if set.
+        /// Respects OrderBy/Skip/Take and any accumulated WhereIf/AndWhere predicates.
         /// </summary>
         public List<T> ToList()
         {
+            if ((_pendingPredicates != null && _pendingPredicates.Count > 0)
+                || (_rawWhereFragments != null && _rawWhereFragments.Count > 0))
+                return ExecuteWhere(CombinePending(null));
             if (_orderByClauses != null || _skip.HasValue || _take.HasValue)
                 return ExecuteWhere(null);
             return GetAll();
@@ -300,7 +509,7 @@ namespace LiteSql
         public int Count(Expression<Func<T, bool>> predicate)
         {
             var mapping = MappingCache.GetMapping<T>();
-            var tableName = SqlGenerator.QuoteTableName(mapping.TableName);
+            var tableName = SqlGenerator.QuoteTableName(mapping.TableName, _context.Dialect);
             var whereParts = new List<string>();
             IDictionary<string, object> allParams = new Dictionary<string, object>();
 
@@ -310,7 +519,7 @@ namespace LiteSql
                 var filters = _context.Filters.GetFilters(typeof(T));
                 if (filters.Count > 0)
                 {
-                    var filterBuilder = new WhereBuilder(mapping);
+                    var filterBuilder = new WhereBuilder(mapping, _context.Dialect);
                     foreach (var filter in filters)
                     {
                         var (fSql, fParams) = filterBuilder.BuildFromLambda(filter);
@@ -321,7 +530,7 @@ namespace LiteSql
                 }
             }
 
-            var builder = new WhereBuilder(mapping);
+            var builder = new WhereBuilder(mapping, _context.Dialect);
             var (whereSql, parameters) = builder.Build(predicate);
             whereParts.Add("(" + whereSql + ")");
             if (parameters != null)
@@ -386,7 +595,7 @@ namespace LiteSql
         public List<T> Distinct()
         {
             var mapping = MappingCache.GetMapping<T>();
-            var sql = SqlGenerator.GenerateSelectAll(mapping).Replace("SELECT ", "SELECT DISTINCT ");
+            var sql = SqlGenerator.GenerateSelectAll(mapping, _context.Dialect).Replace("SELECT ", "SELECT DISTINCT ");
             _context.EnsureConnectionOpen();
             return _context.Connection.Query<T>(sql,
                 transaction: _context.Transaction, commandTimeout: _context.CommandTimeout).ToList();
@@ -479,8 +688,8 @@ namespace LiteSql
         public int BatchDelete(Expression<Func<T, bool>> predicate)
         {
             var mapping = MappingCache.GetMapping<T>();
-            var tableName = SqlGenerator.QuoteTableName(mapping.TableName);
-            var builder = new WhereBuilder(mapping);
+            var tableName = SqlGenerator.QuoteTableName(mapping.TableName, _context.Dialect);
+            var builder = new WhereBuilder(mapping, _context.Dialect);
             var (whereSql, whereParams) = builder.Build(predicate);
             var sql = $"DELETE FROM {tableName} WHERE {whereSql}";
             _context.EnsureConnectionOpen();
@@ -495,8 +704,8 @@ namespace LiteSql
             CancellationToken ct = default)
         {
             var mapping = MappingCache.GetMapping<T>();
-            var tableName = SqlGenerator.QuoteTableName(mapping.TableName);
-            var builder = new WhereBuilder(mapping);
+            var tableName = SqlGenerator.QuoteTableName(mapping.TableName, _context.Dialect);
+            var builder = new WhereBuilder(mapping, _context.Dialect);
             var (whereSql, whereParams) = builder.Build(predicate);
             var sql = $"DELETE FROM {tableName} WHERE {whereSql}";
             await _context.EnsureConnectionOpenAsync(ct).ConfigureAwait(false);
@@ -516,8 +725,8 @@ namespace LiteSql
             Expression<Func<T, T>> setter)
         {
             var mapping = MappingCache.GetMapping<T>();
-            var tableName = SqlGenerator.QuoteTableName(mapping.TableName);
-            var builder = new WhereBuilder(mapping);
+            var tableName = SqlGenerator.QuoteTableName(mapping.TableName, _context.Dialect);
+            var builder = new WhereBuilder(mapping, _context.Dialect);
             var (whereSql, whereParams) = builder.Build(predicate);
             var (setClauses, setParams) = BuildSetClauses(setter, mapping);
 
@@ -538,8 +747,8 @@ namespace LiteSql
             Expression<Func<T, T>> setter, CancellationToken ct = default)
         {
             var mapping = MappingCache.GetMapping<T>();
-            var tableName = SqlGenerator.QuoteTableName(mapping.TableName);
-            var builder = new WhereBuilder(mapping);
+            var tableName = SqlGenerator.QuoteTableName(mapping.TableName, _context.Dialect);
+            var builder = new WhereBuilder(mapping, _context.Dialect);
             var (whereSql, whereParams) = builder.Build(predicate);
             var (setClauses, setParams) = BuildSetClauses(setter, mapping);
 
@@ -579,7 +788,7 @@ namespace LiteSql
 
                     var value = Expression.Lambda(assign.Expression).Compile().DynamicInvoke();
                     var paramName = $"@s{idx++}";
-                    clauses.Add($"[{col.ColumnName}] = {paramName}");
+                    clauses.Add($"{_context.Dialect.QuoteIdentifier(col.ColumnName)} = {paramName}");
                     parameters[paramName] = value;
                 }
             }
@@ -618,11 +827,11 @@ namespace LiteSql
         }
 
         /// <summary>
-        /// Async server-side WHERE.
+        /// Async server-side WHERE. Combines any accumulated WhereIf/AndWhere predicates.
         /// </summary>
         public async Task<List<T>> WhereAsync(Expression<Func<T, bool>> predicate, CancellationToken ct = default)
         {
-            return await ExecuteWhereAsync(predicate, ct: ct).ConfigureAwait(false);
+            return await ExecuteWhereAsync(CombinePending(predicate), ct: ct).ConfigureAwait(false);
         }
 
         /// <summary>
@@ -631,7 +840,7 @@ namespace LiteSql
         public async Task<T> FirstOrDefaultAsync(Expression<Func<T, bool>> predicate, CancellationToken ct = default)
         {
             if (_take == null) _take = 1;
-            var results = await ExecuteWhereAsync(predicate, ct: ct).ConfigureAwait(false);
+            var results = await ExecuteWhereAsync(CombinePending(predicate), ct: ct).ConfigureAwait(false);
             return results.FirstOrDefault();
         }
 
@@ -641,7 +850,7 @@ namespace LiteSql
         public async Task<T> FirstOrDefaultAsync(CancellationToken ct = default)
         {
             if (_take == null) _take = 1;
-            var results = await ExecuteWhereAsync(null, ct: ct).ConfigureAwait(false);
+            var results = await ExecuteWhereAsync(CombinePending(null), ct: ct).ConfigureAwait(false);
             return results.FirstOrDefault();
         }
 
@@ -650,7 +859,7 @@ namespace LiteSql
         /// </summary>
         public async Task<T> SingleAsync(Expression<Func<T, bool>> predicate, CancellationToken ct = default)
         {
-            var results = await ExecuteWhereAsync(predicate, ct: ct).ConfigureAwait(false);
+            var results = await ExecuteWhereAsync(CombinePending(predicate), ct: ct).ConfigureAwait(false);
             return results.Single();
         }
 
@@ -659,7 +868,7 @@ namespace LiteSql
         /// </summary>
         public async Task<T> SingleOrDefaultAsync(Expression<Func<T, bool>> predicate, CancellationToken ct = default)
         {
-            var results = await ExecuteWhereAsync(predicate, ct: ct).ConfigureAwait(false);
+            var results = await ExecuteWhereAsync(CombinePending(predicate), ct: ct).ConfigureAwait(false);
             return results.SingleOrDefault();
         }
 
@@ -669,7 +878,7 @@ namespace LiteSql
         public async Task<T> FirstAsync(Expression<Func<T, bool>> predicate, CancellationToken ct = default)
         {
             if (_take == null) _take = 1;
-            var results = await ExecuteWhereAsync(predicate, ct: ct).ConfigureAwait(false);
+            var results = await ExecuteWhereAsync(CombinePending(predicate), ct: ct).ConfigureAwait(false);
             return results.First();
         }
 
@@ -679,7 +888,7 @@ namespace LiteSql
         public async Task<int> CountAsync(Expression<Func<T, bool>> predicate, CancellationToken ct = default)
         {
             var mapping = MappingCache.GetMapping<T>();
-            var tableName = SqlGenerator.QuoteTableName(mapping.TableName);
+            var tableName = SqlGenerator.QuoteTableName(mapping.TableName, _context.Dialect);
             var whereParts = new List<string>();
             IDictionary<string, object> allParams = new Dictionary<string, object>();
 
@@ -689,7 +898,7 @@ namespace LiteSql
                 var filters = _context.Filters.GetFilters(typeof(T));
                 if (filters.Count > 0)
                 {
-                    var filterBuilder = new WhereBuilder(mapping);
+                    var filterBuilder = new WhereBuilder(mapping, _context.Dialect);
                     foreach (var filter in filters)
                     {
                         var (fSql, fParams) = filterBuilder.BuildFromLambda(filter);
@@ -700,7 +909,7 @@ namespace LiteSql
                 }
             }
 
-            var builder = new WhereBuilder(mapping);
+            var builder = new WhereBuilder(mapping, _context.Dialect);
             var (whereSql, parameters) = builder.Build(predicate);
             whereParts.Add("(" + whereSql + ")");
             if (parameters != null)
@@ -763,7 +972,7 @@ namespace LiteSql
         public async Task<List<T>> DistinctAsync(CancellationToken ct = default)
         {
             var mapping = MappingCache.GetMapping<T>();
-            var sql = SqlGenerator.GenerateSelectAll(mapping).Replace("SELECT ", "SELECT DISTINCT ");
+            var sql = SqlGenerator.GenerateSelectAll(mapping, _context.Dialect).Replace("SELECT ", "SELECT DISTINCT ");
             await _context.EnsureConnectionOpenAsync(ct).ConfigureAwait(false);
             return (await _context.Connection.QueryAsync<T>(
                 new CommandDefinition(sql, transaction: _context.Transaction,
@@ -775,6 +984,10 @@ namespace LiteSql
         /// </summary>
         public async Task<List<T>> ToListAsync(CancellationToken ct = default)
         {
+            if ((_pendingPredicates != null && _pendingPredicates.Count > 0)
+                || (_rawWhereFragments != null && _rawWhereFragments.Count > 0))
+                return await ExecuteWhereAsync(CombinePending(null), ct: ct).ConfigureAwait(false);
+
             if (_orderByClauses != null || _skip.HasValue || _take.HasValue)
                 return await ExecuteWhereAsync(null, ct: ct).ConfigureAwait(false);
 
@@ -787,7 +1000,7 @@ namespace LiteSql
 
             await _context.EnsureConnectionOpenAsync(ct).ConfigureAwait(false);
             var mapping = MappingCache.GetMapping<T>();
-            var sql = SqlGenerator.GenerateSelectAll(mapping);
+            var sql = SqlGenerator.GenerateSelectAll(mapping, _context.Dialect);
             var results = (await _context.Connection.QueryAsync<T>(
                 new CommandDefinition(sql, transaction: _context.Transaction,
                     commandTimeout: _context.CommandTimeout, cancellationToken: ct)).ConfigureAwait(false)).ToList();
@@ -861,18 +1074,19 @@ namespace LiteSql
             return entity;
         }
 
-        private static (string sql, DynamicParameters dp) BuildFindSql(
+        private (string sql, DynamicParameters dp) BuildFindSql(
             EntityMapping mapping, List<ColumnMapping> pks, object[] keyValues)
         {
+            var dialect = _context.Dialect;
             var conditions = new List<string>();
             var dp = new DynamicParameters();
             for (int i = 0; i < pks.Count; i++)
             {
                 var paramName = $"@pk{i}";
-                conditions.Add($"[{pks[i].ColumnName}] = {paramName}");
+                conditions.Add($"{dialect.QuoteIdentifier(pks[i].ColumnName)} = {paramName}");
                 dp.Add(paramName, keyValues[i]);
             }
-            var sql = $"{SqlGenerator.GenerateSelectAll(mapping)} WHERE {string.Join(" AND ", conditions)}";
+            var sql = $"{SqlGenerator.GenerateSelectAll(mapping, _context.Dialect)} WHERE {string.Join(" AND ", conditions)}";
             return (sql, dp);
         }
 
@@ -893,9 +1107,10 @@ namespace LiteSql
             var orderBy = _orderByClauses;
             var skip = _skip;
             var take = _take;
+            var rawFragments = _rawWhereFragments;
             ResetQueryState();
 
-            var (fullSql, dp) = BuildWhereSql(mapping, predicate, orderBy, skip, take);
+            var (fullSql, dp) = BuildWhereSql(mapping, predicate, orderBy, skip, take, rawFragments);
             _context.EnsureConnectionOpen();
             var results = _context.Connection.Query<T>(fullSql, dp,
                 transaction: _context.Transaction, commandTimeout: _context.CommandTimeout).ToList();
@@ -911,9 +1126,10 @@ namespace LiteSql
             var orderBy = _orderByClauses;
             var skip = _skip;
             var take = _take;
+            var rawFragments = _rawWhereFragments;
             ResetQueryState();
 
-            var (fullSql, dp) = BuildWhereSql(mapping, predicate, orderBy, skip, take);
+            var (fullSql, dp) = BuildWhereSql(mapping, predicate, orderBy, skip, take, rawFragments);
             await _context.EnsureConnectionOpenAsync(ct).ConfigureAwait(false);
             var results = (await _context.Connection.QueryAsync<T>(
                 new CommandDefinition(fullSql, dp, transaction: _context.Transaction,
@@ -925,9 +1141,10 @@ namespace LiteSql
 
         private (string sql, DynamicParameters dp) BuildWhereSql(
             EntityMapping mapping, Expression<Func<T, bool>> predicate,
-            List<string> orderByClauses, int? skip, int? take)
+            List<string> orderByClauses, int? skip, int? take,
+            List<(string Sql, IDictionary<string, object> Parameters)> rawFragments = null)
         {
-            var selectAll = SqlGenerator.GenerateSelectAll(mapping);
+            var selectAll = SqlGenerator.GenerateSelectAll(mapping, _context.Dialect);
             IDictionary<string, object> parameters = null;
 
             // Combine global filters with user predicate
@@ -939,7 +1156,7 @@ namespace LiteSql
                 var filters = _context.Filters.GetFilters(typeof(T));
                 if (filters.Count > 0)
                 {
-                    var filterBuilder = new WhereBuilder(mapping);
+                    var filterBuilder = new WhereBuilder(mapping, _context.Dialect);
                     var allFilterParams = new Dictionary<string, object>();
                     foreach (var filter in filters)
                     {
@@ -959,7 +1176,7 @@ namespace LiteSql
             string fullSql;
             if (predicate != null)
             {
-                var builder = new WhereBuilder(mapping);
+                var builder = new WhereBuilder(mapping, _context.Dialect);
                 var (whereSql, whereParams) = builder.Build(predicate);
                 parameters = whereParams;
 
@@ -988,54 +1205,75 @@ namespace LiteSql
                 }
             }
 
+            // Append accumulated raw WHERE fragments (EXISTS / IN subqueries).
+            if (rawFragments != null && rawFragments.Count > 0)
+            {
+                var hasWhere = fullSql.IndexOf(" WHERE ", StringComparison.Ordinal) >= 0;
+                foreach (var frag in rawFragments)
+                {
+                    fullSql += hasWhere ? $" AND ({frag.Sql})" : $" WHERE ({frag.Sql})";
+                    hasWhere = true;
+                    if (frag.Parameters != null)
+                        MergeParams(ref parameters, frag.Parameters);
+                }
+            }
+
             // ORDER BY
             if (orderByClauses != null && orderByClauses.Count > 0)
             {
                 fullSql += $" ORDER BY {string.Join(", ", orderByClauses)}";
             }
 
-            // Pagination
-            var isSqlite = _context.Connection.GetType().Name
-                .IndexOf("sqlite", StringComparison.OrdinalIgnoreCase) >= 0;
-
-            if (skip.HasValue || take.HasValue)
-            {
-                if (isSqlite)
-                {
-                    // SQLite: LIMIT {take} OFFSET {skip}
-                    if (take.HasValue)
-                        fullSql += $" LIMIT {take.Value}";
-                    else
-                        fullSql += " LIMIT -1"; // unlimited
-                    if (skip.HasValue)
-                        fullSql += $" OFFSET {skip.Value}";
-                }
-                else
-                {
-                    // SQL Server: OFFSET ... ROWS FETCH NEXT ... ROWS ONLY
-                    // ORDER BY is required for OFFSET/FETCH
-                    if (orderByClauses == null || orderByClauses.Count == 0)
-                        fullSql += " ORDER BY (SELECT NULL)";
-
-                    fullSql += $" OFFSET {skip ?? 0} ROWS";
-                    if (take.HasValue)
-                        fullSql += $" FETCH NEXT {take.Value} ROWS ONLY";
-                }
-            }
-            else if (take.HasValue && orderByClauses == null)
-            {
-                // Legacy TOP behavior for FirstOrDefault without OrderBy
-                if (isSqlite)
-                    fullSql += $" LIMIT {take.Value}";
-                else
-                    fullSql = fullSql.Replace("SELECT ", $"SELECT TOP {take.Value} ");
-            }
+            // Pagination (dialect-aware)
+            fullSql = ApplyPagination(fullSql, orderByClauses, skip, take);
 
             // Query tag for debugging
             if (_queryTag != null)
                 fullSql = $"/* {_queryTag} */ {fullSql}";
 
             return (fullSql, ToDp(parameters));
+        }
+
+        /// <summary>
+        /// Appends pagination syntax appropriate for the current dialect.
+        /// SQLite/MySQL/PostgreSQL use LIMIT/OFFSET; SQL Server uses OFFSET/FETCH (or TOP).
+        /// </summary>
+        private string ApplyPagination(string sql, List<string> orderByClauses, int? skip, int? take)
+        {
+            var provider = _context.Dialect.ProviderName;
+            var usesLimit = provider == "SQLite" || provider == "MySQL" || provider == "PostgreSQL";
+
+            if (skip.HasValue || take.HasValue)
+            {
+                if (usesLimit)
+                {
+                    if (take.HasValue)
+                        sql += $" LIMIT {take.Value}";
+                    else
+                        sql += " LIMIT -1"; // unlimited (SQLite); MySQL/PG tolerate large LIMIT
+                    if (skip.HasValue)
+                        sql += $" OFFSET {skip.Value}";
+                }
+                else
+                {
+                    // SQL Server: OFFSET ... ROWS FETCH NEXT ... ROWS ONLY (requires ORDER BY)
+                    if (orderByClauses == null || orderByClauses.Count == 0)
+                        sql += " ORDER BY (SELECT NULL)";
+                    sql += $" OFFSET {skip ?? 0} ROWS";
+                    if (take.HasValue)
+                        sql += $" FETCH NEXT {take.Value} ROWS ONLY";
+                }
+            }
+            else if (take.HasValue && (orderByClauses == null || orderByClauses.Count == 0))
+            {
+                // Legacy TOP/LIMIT behavior for FirstOrDefault without OrderBy
+                if (usesLimit)
+                    sql += $" LIMIT {take.Value}";
+                else
+                    sql = sql.Replace("SELECT ", $"SELECT TOP {take.Value} ");
+            }
+
+            return sql;
         }
 
         #endregion
@@ -1079,15 +1317,15 @@ namespace LiteSql
             Expression<Func<T, bool>> predicate,
             List<string> orderByClauses, int? skip, int? take)
         {
-            var selectBuilder = new SelectBuilder(mapping);
+            var selectBuilder = new SelectBuilder(mapping, _context.Dialect);
             var columnList = selectBuilder.Build(selector);
-            var tableName = SqlGenerator.QuoteTableName(mapping.TableName);
+            var tableName = SqlGenerator.QuoteTableName(mapping.TableName, _context.Dialect);
 
             IDictionary<string, object> parameters = null;
             string fullSql;
             if (predicate != null)
             {
-                var builder = new WhereBuilder(mapping);
+                var builder = new WhereBuilder(mapping, _context.Dialect);
                 var (whereSql, whereParams) = builder.Build(predicate);
                 parameters = whereParams;
                 fullSql = $"SELECT {columnList} FROM {tableName} WHERE {whereSql}";
@@ -1101,27 +1339,8 @@ namespace LiteSql
             if (orderByClauses != null && orderByClauses.Count > 0)
                 fullSql += $" ORDER BY {string.Join(", ", orderByClauses)}";
 
-            // Pagination — reuse same logic as BuildWhereSql
-            var isSqlite = _context.Connection.GetType().Name
-                .IndexOf("sqlite", StringComparison.OrdinalIgnoreCase) >= 0;
-
-            if (skip.HasValue || take.HasValue)
-            {
-                if (isSqlite)
-                {
-                    if (take.HasValue) fullSql += $" LIMIT {take.Value}";
-                    else fullSql += " LIMIT -1";
-                    if (skip.HasValue) fullSql += $" OFFSET {skip.Value}";
-                }
-                else
-                {
-                    if (orderByClauses == null || orderByClauses.Count == 0)
-                        fullSql += " ORDER BY (SELECT NULL)";
-                    fullSql += $" OFFSET {skip ?? 0} ROWS";
-                    if (take.HasValue)
-                        fullSql += $" FETCH NEXT {take.Value} ROWS ONLY";
-                }
-            }
+            // Pagination (dialect-aware)
+            fullSql = ApplyPagination(fullSql, orderByClauses, skip, take);
 
             return (fullSql, ToDp(parameters));
         }
@@ -1135,7 +1354,7 @@ namespace LiteSql
         {
             var mapping = MappingCache.GetMapping<T>();
             var columnName = ExtractColumnNameFromLambda(selector, mapping);
-            var tableName = SqlGenerator.QuoteTableName(mapping.TableName);
+            var tableName = SqlGenerator.QuoteTableName(mapping.TableName, _context.Dialect);
 
             var whereParts = new List<string>();
             IDictionary<string, object> parameters = null;
@@ -1146,7 +1365,7 @@ namespace LiteSql
                 var filters = _context.Filters.GetFilters(typeof(T));
                 if (filters.Count > 0)
                 {
-                    var filterBuilder = new WhereBuilder(mapping);
+                    var filterBuilder = new WhereBuilder(mapping, _context.Dialect);
                     parameters = new Dictionary<string, object>();
                     foreach (var filter in filters)
                     {
@@ -1161,7 +1380,7 @@ namespace LiteSql
 
             if (predicate != null)
             {
-                var builder = new WhereBuilder(mapping);
+                var builder = new WhereBuilder(mapping, _context.Dialect);
                 var (whereSql, whereParams) = builder.Build(predicate);
                 whereParts.Add("(" + whereSql + ")");
                 if (parameters == null) parameters = whereParams;
@@ -1172,9 +1391,9 @@ namespace LiteSql
 
             string sql;
             if (whereParts.Count > 0)
-                sql = $"SELECT {function}([{columnName}]) FROM {tableName} WHERE {string.Join(" AND ", whereParts)}";
+                sql = $"SELECT {function}({_context.Dialect.QuoteIdentifier(columnName)}) FROM {tableName} WHERE {string.Join(" AND ", whereParts)}";
             else
-                sql = $"SELECT {function}([{columnName}]) FROM {tableName}";
+                sql = $"SELECT {function}({_context.Dialect.QuoteIdentifier(columnName)}) FROM {tableName}";
 
             _context.EnsureConnectionOpen();
             return _context.Connection.ExecuteScalar<TResult>(sql, ToDp(parameters),
@@ -1186,20 +1405,20 @@ namespace LiteSql
         {
             var mapping = MappingCache.GetMapping<T>();
             var columnName = ExtractColumnNameFromLambda(selector, mapping);
-            var tableName = SqlGenerator.QuoteTableName(mapping.TableName);
+            var tableName = SqlGenerator.QuoteTableName(mapping.TableName, _context.Dialect);
 
             string sql;
             IDictionary<string, object> parameters = null;
             if (predicate != null)
             {
-                var builder = new WhereBuilder(mapping);
+                var builder = new WhereBuilder(mapping, _context.Dialect);
                 var (whereSql, whereParams) = builder.Build(predicate);
                 parameters = whereParams;
-                sql = $"SELECT {function}([{columnName}]) FROM {tableName} WHERE {whereSql}";
+                sql = $"SELECT {function}({_context.Dialect.QuoteIdentifier(columnName)}) FROM {tableName} WHERE {whereSql}";
             }
             else
             {
-                sql = $"SELECT {function}([{columnName}]) FROM {tableName}";
+                sql = $"SELECT {function}({_context.Dialect.QuoteIdentifier(columnName)}) FROM {tableName}";
             }
 
             await _context.EnsureConnectionOpenAsync(ct).ConfigureAwait(false);
@@ -1218,6 +1437,10 @@ namespace LiteSql
             _orderByClauses = null;
             _skip = null;
             _take = null;
+            _pendingPredicates = null;
+            _rawWhereFragments = null;
+            _subqueryAliasSeq = 0;
+            _subqueryParamSeed = 0;
         }
 
         #endregion
@@ -1234,7 +1457,7 @@ namespace LiteSql
             }
 
             var mapping = MappingCache.GetMapping<T>();
-            var results = _context.ExecuteQuery<T>(SqlGenerator.GenerateSelectAll(mapping)).ToList();
+            var results = _context.ExecuteQuery<T>(SqlGenerator.GenerateSelectAll(mapping, _context.Dialect)).ToList();
             TrackResults(results, mapping);
             LoadAssociations(results, mapping);
             return results;
@@ -1345,7 +1568,7 @@ namespace LiteSql
 
             // Get related entity mapping
             var relatedMapping = MappingCache.GetMapping(assoc.OtherType);
-            var quotedTable = SqlGenerator.QuoteTableName(relatedMapping.TableName);
+            var quotedTable = SqlGenerator.QuoteTableName(relatedMapping.TableName, _context.Dialect);
 
             // Build batch IN query: SELECT * FROM [dbo].[tbSYS_User] WHERE [id] IN (@p0, @p1, ...)
             var dp = new DynamicParameters();
@@ -1357,7 +1580,7 @@ namespace LiteSql
                 dp.Add(pName, fkValues[i]);
             }
 
-            var sql = $"SELECT * FROM {quotedTable} WHERE [{assoc.OtherKey}] IN ({string.Join(", ", paramNames)})";
+            var sql = $"SELECT * FROM {quotedTable} WHERE {_context.Dialect.QuoteIdentifier(assoc.OtherKey)} IN ({string.Join(", ", paramNames)})";
 
             _context.EnsureConnectionOpen();
             // Query as dynamic, then use Dapper to map
@@ -1459,7 +1682,7 @@ namespace LiteSql
             if (fkValues.Count == 0) return;
 
             var relatedMapping = MappingCache.GetMapping(assoc.OtherType);
-            var quotedTable = SqlGenerator.QuoteTableName(relatedMapping.TableName);
+            var quotedTable = SqlGenerator.QuoteTableName(relatedMapping.TableName, _context.Dialect);
 
             var dp = new DynamicParameters();
             var paramNames = new List<string>();
@@ -1470,7 +1693,7 @@ namespace LiteSql
                 dp.Add(pName, fkValues[i]);
             }
 
-            var sql = $"SELECT * FROM {quotedTable} WHERE [{assoc.OtherKey}] IN ({string.Join(", ", paramNames)})";
+            var sql = $"SELECT * FROM {quotedTable} WHERE {_context.Dialect.QuoteIdentifier(assoc.OtherKey)} IN ({string.Join(", ", paramNames)})";
 
             await _context.EnsureConnectionOpenAsync(ct).ConfigureAwait(false);
             var relatedEntities = (await _context.Connection.QueryAsync(
@@ -1517,7 +1740,7 @@ namespace LiteSql
             if (pkValues.Count == 0) return;
 
             var childMapping = MappingCache.GetMapping(assoc.OtherType);
-            var quotedTable = SqlGenerator.QuoteTableName(childMapping.TableName);
+            var quotedTable = SqlGenerator.QuoteTableName(childMapping.TableName, _context.Dialect);
 
             var dp = new DynamicParameters();
             var paramNames = new List<string>();
@@ -1528,7 +1751,7 @@ namespace LiteSql
                 dp.Add(pName, pkValues[i]);
             }
 
-            var sql = $"SELECT * FROM {quotedTable} WHERE [{assoc.OtherKey}] IN ({string.Join(", ", paramNames)})";
+            var sql = $"SELECT * FROM {quotedTable} WHERE {_context.Dialect.QuoteIdentifier(assoc.OtherKey)} IN ({string.Join(", ", paramNames)})";
 
             _context.EnsureConnectionOpen();
             var children = _context.Connection.Query(
@@ -1590,7 +1813,7 @@ namespace LiteSql
             if (pkValues.Count == 0) return;
 
             var childMapping = MappingCache.GetMapping(assoc.OtherType);
-            var quotedTable = SqlGenerator.QuoteTableName(childMapping.TableName);
+            var quotedTable = SqlGenerator.QuoteTableName(childMapping.TableName, _context.Dialect);
 
             var dp = new DynamicParameters();
             var paramNames = new List<string>();
@@ -1601,7 +1824,7 @@ namespace LiteSql
                 dp.Add(pName, pkValues[i]);
             }
 
-            var sql = $"SELECT * FROM {quotedTable} WHERE [{assoc.OtherKey}] IN ({string.Join(", ", paramNames)})";
+            var sql = $"SELECT * FROM {quotedTable} WHERE {_context.Dialect.QuoteIdentifier(assoc.OtherKey)} IN ({string.Join(", ", paramNames)})";
 
             await _context.EnsureConnectionOpenAsync(ct).ConfigureAwait(false);
             var children = (await _context.Connection.QueryAsync(

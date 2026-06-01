@@ -30,7 +30,7 @@ namespace LiteSql
         {
             if (condition)
             {
-                table.Where(predicate);
+                table.AddPendingPredicate(predicate);
             }
             return table;
         }

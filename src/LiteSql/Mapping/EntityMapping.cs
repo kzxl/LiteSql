@@ -58,6 +58,11 @@ namespace LiteSql.Mapping
         public IReadOnlyList<AssociationMapping> Associations { get; set; }
 
         /// <summary>
+        /// Columns flagged with IsVersion=true, used for optimistic concurrency checks.
+        /// </summary>
+        public IReadOnlyList<ColumnMapping> VersionColumns { get; set; }
+
+        /// <summary>
         /// One-to-many collection navigation (IsForeignKey=false).
         /// The OtherType is the child element type, ThisKey is PK on parent, OtherKey is FK on child.
         /// </summary>
@@ -145,11 +150,27 @@ namespace LiteSql.Mapping
                                     Nullable.GetUnderlyingType(prop.PropertyType) != null
                     });
                 }
+
+                // Convention PK detection: prefer "Id", then "{TypeName}Id" (case-insensitive).
+                // An integral PK is assumed DB-generated (identity/auto-increment).
+                var pkCol = allColumns.FirstOrDefault(c =>
+                                string.Equals(c.Property.Name, "Id", StringComparison.OrdinalIgnoreCase))
+                            ?? allColumns.FirstOrDefault(c =>
+                                string.Equals(c.Property.Name, type.Name + "Id", StringComparison.OrdinalIgnoreCase));
+
+                if (pkCol != null)
+                {
+                    pkCol.IsPrimaryKey = true;
+                    var pkType = Nullable.GetUnderlyingType(pkCol.Property.PropertyType) ?? pkCol.Property.PropertyType;
+                    if (pkType == typeof(int) || pkType == typeof(long) || pkType == typeof(short))
+                        pkCol.IsDbGenerated = true;
+                }
             }
 
             var primaryKeys = allColumns.Where(c => c.IsPrimaryKey).ToList();
             var insertable = allColumns.Where(c => !c.IsDbGenerated).ToList();
             var updatable = allColumns.Where(c => !c.IsPrimaryKey && !c.IsDbGenerated).ToList();
+            var versionColumns = allColumns.Where(c => c.IsVersion).ToList();
 
             // Build association mappings from [Association] attributes
             var associations = new List<AssociationMapping>();
@@ -203,6 +224,7 @@ namespace LiteSql.Mapping
                 InsertableColumns = insertable,
                 UpdatableColumns = updatable,
                 Associations = associations,
+                VersionColumns = versionColumns,
                 CollectionAssociations = collectionAssociations
             };
         }

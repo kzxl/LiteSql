@@ -15,6 +15,20 @@ namespace LiteSql.Sql
         private static long _misses;
 
         /// <summary>
+        /// Maximum number of compiled delegates retained. When exceeded, the cache is cleared
+        /// to bound memory in long-running processes that generate many distinct expressions.
+        /// Set to 0 or negative to disable the cap.
+        /// </summary>
+        public static int MaxSize { get; set; } = 5000;
+
+        private static void AddWithEviction(ExpressionCacheKey key, Delegate compiled)
+        {
+            if (MaxSize > 0 && Cache.Count >= MaxSize)
+                Cache.Clear();
+            Cache.TryAdd(key, compiled);
+        }
+
+        /// <summary>
         /// Gets or compiles an expression with a single parameter.
         /// </summary>
         public static Func<T, TResult> GetOrAdd<T, TResult>(Expression<Func<T, TResult>> expression)
@@ -32,7 +46,7 @@ namespace LiteSql.Sql
 
             System.Threading.Interlocked.Increment(ref _misses);
             var compiled = expression.Compile();
-            Cache.TryAdd(key, compiled);
+            AddWithEviction(key, compiled);
             return compiled;
         }
 
@@ -54,7 +68,7 @@ namespace LiteSql.Sql
 
             System.Threading.Interlocked.Increment(ref _misses);
             var compiled = expression.Compile();
-            Cache.TryAdd(key, compiled);
+            AddWithEviction(key, compiled);
             return compiled;
         }
 
@@ -76,7 +90,7 @@ namespace LiteSql.Sql
 
             System.Threading.Interlocked.Increment(ref _misses);
             var compiled = expression.Compile();
-            Cache.TryAdd(key, compiled);
+            AddWithEviction(key, compiled);
             return compiled;
         }
 

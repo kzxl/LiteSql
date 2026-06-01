@@ -22,6 +22,7 @@ namespace LiteSql
         private readonly LambdaExpression _groupByExpression;
         private readonly string _whereClause;
         private readonly IDictionary<string, object> _whereParameters;
+        private readonly LiteSql.Dialects.ISqlDialect _dialect;
         private LambdaExpression _havingClause;
         private List<string> _orderByClauses;
 
@@ -31,7 +32,8 @@ namespace LiteSql
             string tableName,
             LambdaExpression groupByExpression,
             string whereClause,
-            IDictionary<string, object> whereParameters)
+            IDictionary<string, object> whereParameters,
+            LiteSql.Dialects.ISqlDialect dialect = null)
         {
             _context = context ?? throw new ArgumentNullException(nameof(context));
             _mapping = mapping ?? throw new ArgumentNullException(nameof(mapping));
@@ -39,6 +41,7 @@ namespace LiteSql
             _groupByExpression = groupByExpression ?? throw new ArgumentNullException(nameof(groupByExpression));
             _whereClause = whereClause;
             _whereParameters = whereParameters;
+            _dialect = dialect ?? context.Dialect;
         }
 
         /// <summary>
@@ -54,6 +57,17 @@ namespace LiteSql
             var (sql, parameters) = BuildQuery(selector);
 
             _context.EnsureConnectionOpen();
+
+            if (Sql.ProjectionMaterializer.RequiresManualMaterialization(typeof(TResult)))
+            {
+                var rows = _context.Connection.Query(
+                    sql,
+                    parameters,
+                    transaction: _context.Transaction,
+                    commandTimeout: _context.CommandTimeout);
+                return Sql.ProjectionMaterializer.Materialize<TResult>(rows.Cast<object>());
+            }
+
             var results = _context.Connection.Query<TResult>(
                 sql,
                 parameters,
@@ -76,11 +90,22 @@ namespace LiteSql
             var (sql, parameters) = BuildQuery(selector);
 
             _context.EnsureConnectionOpen();
+
+            if (Sql.ProjectionMaterializer.RequiresManualMaterialization(typeof(TResult)))
+            {
+                var rows = await _context.Connection.QueryAsync(
+                    sql,
+                    parameters,
+                    transaction: _context.Transaction,
+                    commandTimeout: _context.CommandTimeout).ConfigureAwait(false);
+                return Sql.ProjectionMaterializer.Materialize<TResult>(rows.Cast<object>());
+            }
+
             var results = await _context.Connection.QueryAsync<TResult>(
                 sql,
                 parameters,
                 transaction: _context.Transaction,
-                commandTimeout: _context.CommandTimeout);
+                commandTimeout: _context.CommandTimeout).ConfigureAwait(false);
 
             return results.ToList();
         }
@@ -113,7 +138,7 @@ namespace LiteSql
                 _orderByClauses = new List<string>();
 
             var columnName = ExtractOrderByColumn(keySelector);
-            _orderByClauses.Add($"[{columnName}] ASC");
+            _orderByClauses.Add($"{_dialect.QuoteIdentifier(columnName)} ASC");
             return this;
         }
 
@@ -131,7 +156,7 @@ namespace LiteSql
                 _orderByClauses = new List<string>();
 
             var columnName = ExtractOrderByColumn(keySelector);
-            _orderByClauses.Add($"[{columnName}] DESC");
+            _orderByClauses.Add($"{_dialect.QuoteIdentifier(columnName)} DESC");
             return this;
         }
 
@@ -152,8 +177,9 @@ namespace LiteSql
 
             var (sql, parameters) = BuildQuery(selector);
 
-            // Replace parameters with their values for debugging
-            foreach (var kvp in parameters)
+            // Replace parameters with their values for debugging.
+            // Order by descending key length so "@h10" is replaced before "@h1" (avoids partial-match corruption).
+            foreach (var kvp in parameters.OrderByDescending(p => p.Key.Length))
             {
                 var key = kvp.Key;
                 var value = kvp.Value;
@@ -199,7 +225,7 @@ namespace LiteSql
                 throw new InvalidOperationException("ThenBy must be called after OrderBy or OrderByDescending.");
 
             var columnName = ExtractOrderByColumn(keySelector);
-            _orderByClauses.Add($"[{columnName}] ASC");
+            _orderByClauses.Add($"{_dialect.QuoteIdentifier(columnName)} ASC");
             return this;
         }
 
@@ -216,7 +242,7 @@ namespace LiteSql
                 throw new InvalidOperationException("ThenByDescending must be called after OrderBy or OrderByDescending.");
 
             var columnName = ExtractOrderByColumn(keySelector);
-            _orderByClauses.Add($"[{columnName}] DESC");
+            _orderByClauses.Add($"{_dialect.QuoteIdentifier(columnName)} DESC");
             return this;
         }
 
@@ -226,7 +252,7 @@ namespace LiteSql
         private (string Sql, IDictionary<string, object> Parameters) BuildQuery<TResult>(
             Expression<Func<IGrouping<TKey, T>, TResult>> selector)
         {
-            var builder = new GroupByBuilder(_mapping);
+            var builder = new GroupByBuilder(_mapping, _dialect);
 
             var (sql, parameters) = builder.BuildGroupByQuery(
                 _tableName,

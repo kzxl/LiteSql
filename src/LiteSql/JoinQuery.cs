@@ -3,7 +3,9 @@ using System.Collections.Generic;
 using System.Data;
 using System.Linq;
 using System.Linq.Expressions;
+using System.Threading.Tasks;
 using Dapper;
+using LiteSql.Dialects;
 using LiteSql.Mapping;
 using LiteSql.Sql;
 
@@ -11,20 +13,22 @@ namespace LiteSql
 {
     /// <summary>
     /// Represents a LINQ-style join query between two tables.
-    /// Supports INNER JOIN and LEFT JOIN operations.
+    /// Supports INNER JOIN and LEFT JOIN operations, optional WHERE filtering,
+    /// and both sync and async materialization.
     /// </summary>
     public class JoinQuery<T1, T2, TResult> where T1 : class where T2 : class
     {
         private readonly IDbConnection _connection;
         private readonly IDbTransaction _transaction;
+        private readonly ISqlDialect _dialect;
         private readonly EntityMapping _mapping1;
         private readonly EntityMapping _mapping2;
         private readonly Expression<Func<T1, object>> _outerKeySelector;
         private readonly Expression<Func<T2, object>> _innerKeySelector;
         private readonly Expression<Func<T1, T2, TResult>> _resultSelector;
         private readonly JoinType _joinType;
-        private string _whereClause;
-        private IDictionary<string, object> _whereParameters;
+        private readonly List<Expression<Func<T1, T2, bool>>> _wherePredicates
+            = new List<Expression<Func<T1, T2, bool>>>();
 
         internal JoinQuery(
             IDbConnection connection,
@@ -32,10 +36,12 @@ namespace LiteSql
             Expression<Func<T1, object>> outerKeySelector,
             Expression<Func<T2, object>> innerKeySelector,
             Expression<Func<T1, T2, TResult>> resultSelector,
-            JoinType joinType)
+            JoinType joinType,
+            ISqlDialect dialect = null)
         {
             _connection = connection ?? throw new ArgumentNullException(nameof(connection));
             _transaction = transaction;
+            _dialect = dialect ?? SqlGenerator.DefaultDialect;
             _mapping1 = MappingCache.GetMapping<T1>();
             _mapping2 = MappingCache.GetMapping<T2>();
             _outerKeySelector = outerKeySelector ?? throw new ArgumentNullException(nameof(outerKeySelector));
@@ -45,16 +51,16 @@ namespace LiteSql
         }
 
         /// <summary>
-        /// Filters the join results with a WHERE clause.
+        /// Filters the join results with a WHERE clause that can reference both joined entities.
+        /// Multiple calls are combined with AND.
+        /// Example: .Where((o, c) =&gt; c.Country == "VN" &amp;&amp; o.Amount &gt; 100)
         /// </summary>
-        public JoinQuery<T1, T2, TResult> Where(Expression<Func<TResult, bool>> predicate)
+        public JoinQuery<T1, T2, TResult> Where(Expression<Func<T1, T2, bool>> predicate)
         {
             if (predicate == null)
                 throw new ArgumentNullException(nameof(predicate));
-
-            // For now, we'll build a simple WHERE clause
-            // In a full implementation, this would need to handle the result selector properly
-            throw new NotImplementedException("Where clause on join results is not yet implemented. Use Where on individual tables before joining.");
+            _wherePredicates.Add(predicate);
+            return this;
         }
 
         /// <summary>
@@ -62,16 +68,32 @@ namespace LiteSql
         /// </summary>
         public List<TResult> ToList()
         {
-            var builder = new JoinBuilder(_mapping1, _mapping2);
-            var (sql, parameters) = builder.BuildJoinQuery(
-                _outerKeySelector,
-                _innerKeySelector,
-                _resultSelector,
-                _joinType,
-                _whereClause,
-                _whereParameters);
+            var (sql, parameters) = Build();
+
+            if (ProjectionMaterializer.RequiresManualMaterialization(typeof(TResult)))
+            {
+                var rows = _connection.Query(sql, parameters, _transaction);
+                return ProjectionMaterializer.Materialize<TResult>(rows.Cast<object>());
+            }
 
             return _connection.Query<TResult>(sql, parameters, _transaction).ToList();
+        }
+
+        /// <summary>
+        /// Async version of ToList.
+        /// </summary>
+        public async Task<List<TResult>> ToListAsync()
+        {
+            var (sql, parameters) = Build();
+
+            if (ProjectionMaterializer.RequiresManualMaterialization(typeof(TResult)))
+            {
+                var rows = await _connection.QueryAsync(sql, parameters, _transaction).ConfigureAwait(false);
+                return ProjectionMaterializer.Materialize<TResult>(rows.Cast<object>());
+            }
+
+            return (await _connection.QueryAsync<TResult>(sql, parameters, _transaction)
+                .ConfigureAwait(false)).ToList();
         }
 
         /// <summary>
@@ -95,19 +117,32 @@ namespace LiteSql
         }
 
         /// <summary>
+        /// Async version of FirstOrDefault.
+        /// </summary>
+        public async Task<TResult> FirstOrDefaultAsync()
+        {
+            var results = await ToListAsync().ConfigureAwait(false);
+            return results.Count > 0 ? results[0] : default(TResult);
+        }
+
+        /// <summary>
         /// Returns the SQL query for debugging purposes.
         /// </summary>
         public string ToSql()
         {
-            var builder = new JoinBuilder(_mapping1, _mapping2);
-            var (sql, _) = builder.BuildJoinQuery(
+            var (sql, _) = Build();
+            return sql;
+        }
+
+        private (string Sql, IDictionary<string, object> Parameters) Build()
+        {
+            var builder = new JoinBuilder(_mapping1, _mapping2, _dialect);
+            return builder.BuildJoinQuery(
                 _outerKeySelector,
                 _innerKeySelector,
                 _resultSelector,
                 _joinType,
-                _whereClause,
-                _whereParameters);
-            return sql;
+                _wherePredicates);
         }
     }
 
@@ -137,25 +172,7 @@ namespace LiteSql
             where T1 : class
             where T2 : class
         {
-            if (outer == null) throw new ArgumentNullException(nameof(outer));
-            if (inner == null) throw new ArgumentNullException(nameof(inner));
-
-            // Convert TKey to object for internal use
-            Expression<Func<T1, object>> outerKey = Expression.Lambda<Func<T1, object>>(
-                Expression.Convert(outerKeySelector.Body, typeof(object)),
-                outerKeySelector.Parameters);
-
-            Expression<Func<T2, object>> innerKey = Expression.Lambda<Func<T2, object>>(
-                Expression.Convert(innerKeySelector.Body, typeof(object)),
-                innerKeySelector.Parameters);
-
-            return new JoinQuery<T1, T2, TResult>(
-                outer.Connection,
-                outer.Transaction,
-                outerKey,
-                innerKey,
-                resultSelector,
-                JoinType.Inner);
+            return BuildJoin(outer, inner, outerKeySelector, innerKeySelector, resultSelector, JoinType.Inner);
         }
 
         /// <summary>
@@ -167,6 +184,19 @@ namespace LiteSql
             Expression<Func<T1, TKey>> outerKeySelector,
             Expression<Func<T2, TKey>> innerKeySelector,
             Expression<Func<T1, T2, TResult>> resultSelector)
+            where T1 : class
+            where T2 : class
+        {
+            return BuildJoin(outer, inner, outerKeySelector, innerKeySelector, resultSelector, JoinType.Left);
+        }
+
+        private static JoinQuery<T1, T2, TResult> BuildJoin<T1, T2, TKey, TResult>(
+            Table<T1> outer,
+            Table<T2> inner,
+            Expression<Func<T1, TKey>> outerKeySelector,
+            Expression<Func<T2, TKey>> innerKeySelector,
+            Expression<Func<T1, T2, TResult>> resultSelector,
+            JoinType joinType)
             where T1 : class
             where T2 : class
         {
@@ -187,7 +217,8 @@ namespace LiteSql
                 outerKey,
                 innerKey,
                 resultSelector,
-                JoinType.Left);
+                joinType,
+                outer.Dialect);
         }
     }
 }

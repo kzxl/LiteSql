@@ -65,8 +65,12 @@ namespace LiteSql.Sql
             // Build SELECT clause with aggregates
             var selectClause = BuildSelectClause(selectExpression);
 
-            // Build GROUP BY clause
-            var groupByClause = string.Join(", ", _groupByColumns.Select(c => _dialect.QuoteIdentifier(c.ColumnName)));
+            // Build GROUP BY clause. A single constant key (o => 1) means "all rows in one group";
+            // emit no GROUP BY at all so it works across providers (SQL Server rejects GROUP BY 1).
+            bool literalGroup = _groupByColumns.Count == 1 && _groupByColumns[0].IsLiteral;
+            var groupByClause = literalGroup
+                ? null
+                : string.Join(", ", _groupByColumns.Select(c => _dialect.QuoteIdentifier(c.ColumnName)));
 
             // Build HAVING clause if present
             string havingClause = null;
@@ -90,7 +94,8 @@ namespace LiteSql.Sql
             if (!string.IsNullOrEmpty(whereClause))
                 sql.Append($" WHERE {whereClause}");
 
-            sql.Append($" GROUP BY {groupByClause}");
+            if (!string.IsNullOrEmpty(groupByClause))
+                sql.Append($" GROUP BY {groupByClause}");
 
             if (!string.IsNullOrEmpty(havingClause))
                 sql.Append($" HAVING {havingClause}");
@@ -152,12 +157,12 @@ namespace LiteSql.Sql
             }
             else if (body is ConstantExpression constant)
             {
-                // Constant grouping: o => 1 (all rows in one group)
-                // Use a dummy column name
+                // Constant grouping: o => 1 (all rows in one group). Emit as a literal, unquoted.
                 columns.Add(new GroupByColumn
                 {
                     ColumnName = constant.Value?.ToString() ?? "1",
-                    PropertyName = "Key"
+                    PropertyName = "Key",
+                    IsLiteral = true
                 });
             }
             else
@@ -254,7 +259,9 @@ namespace LiteSql.Sql
                 // Single column GroupBy: g.Key → [CustomerId]
                 if (_groupByColumns.Count == 1)
                 {
-                    return _dialect.QuoteIdentifier(_groupByColumns[0].ColumnName);
+                    return _groupByColumns[0].IsLiteral
+                        ? _groupByColumns[0].ColumnName
+                        : _dialect.QuoteIdentifier(_groupByColumns[0].ColumnName);
                 }
                 else
                 {
@@ -307,7 +314,13 @@ namespace LiteSql.Sql
                 {
                     case "Count":
                     case "LongCount":
-                        // Return COUNT(*) without casting - Dapper will handle type conversion
+                        // Conditional count: g.Count(x => predicate) → SUM(CASE WHEN <pred> THEN 1 ELSE 0 END)
+                        if (methodCall.Arguments.Count >= 2 && methodCall.Arguments[1] is LambdaExpression countPredicate)
+                        {
+                            var condition = TranslateValueExpression(countPredicate.Body);
+                            return $"SUM(CASE WHEN {condition} THEN 1 ELSE 0 END)";
+                        }
+                        // Plain count of all rows in the group.
                         return "COUNT(*)";
 
                     case "Sum":
@@ -323,10 +336,10 @@ namespace LiteSql.Sql
                             throw new InvalidOperationException(
                                 $"{methodName} selector must be a lambda expression.");
 
-                        var columnName = ExtractColumnFromSelector(selector);
+                        var inner = TranslateValueExpression(selector.Body);
                         // Map Average to AVG (not AVERAGE)
                         var sqlFunc = methodName == "Average" ? "AVG" : methodName.ToUpperInvariant();
-                        return $"{sqlFunc}({_dialect.QuoteIdentifier(columnName)})";
+                        return $"{sqlFunc}({inner})";
 
                     default:
                         throw new NotSupportedException(
@@ -350,9 +363,10 @@ namespace LiteSql.Sql
 
         private string VisitHavingExpression(Expression expr)
         {
-            // Unwrap Convert expressions
-            if (expr is UnaryExpression unary && unary.NodeType == ExpressionType.Convert)
-                expr = unary.Operand;
+            // Unwrap Convert/ConvertChecked expressions (e.g., nullable lifting)
+            while (expr is UnaryExpression unaryConv &&
+                   (unaryConv.NodeType == ExpressionType.Convert || unaryConv.NodeType == ExpressionType.ConvertChecked))
+                expr = unaryConv.Operand;
 
             switch (expr)
             {
@@ -368,14 +382,30 @@ namespace LiteSql.Sql
                 case ConstantExpression constant:
                     return AddParameter(constant.Value);
 
-                case MemberExpression member:
+                case MemberExpression member when member.Member.Name == "Key" || IsKeyAccess(member):
                     // Handle g.Key in HAVING clause
                     return TranslateKeyAccessForHaving(member);
+
+                case MemberExpression member:
+                    // Closure / captured variable — evaluate to a parameter value
+                    return AddParameter(EvaluateValue(member));
 
                 default:
                     throw new NotSupportedException(
                         $"Expression type '{expr.NodeType}' is not supported in HAVING clause.");
             }
+        }
+
+        private static bool IsKeyAccess(MemberExpression member)
+        {
+            return member.Expression is MemberExpression inner && inner.Member.Name == "Key";
+        }
+
+        private static object EvaluateValue(Expression expr)
+        {
+            if (expr is ConstantExpression c) return c.Value;
+            var lambda = Expression.Lambda<Func<object>>(Expression.Convert(expr, typeof(object)));
+            return ExpressionCache.GetOrAddFunc<object>(lambda)();
         }
 
         private string VisitHavingBinary(BinaryExpression binary)
@@ -432,6 +462,85 @@ namespace LiteSql.Sql
 
             throw new NotSupportedException(
                 $"Selector expression '{selector}' must be a simple property access (x => x.PropertyName).");
+        }
+
+        /// <summary>
+        /// Translates an aggregate selector or conditional-count predicate body into SQL.
+        /// Supports member access, arithmetic (x.A * x.B), comparisons, AND/OR, and constants.
+        /// </summary>
+        private string TranslateValueExpression(Expression expr)
+        {
+            while (expr is UnaryExpression u &&
+                   (u.NodeType == ExpressionType.Convert || u.NodeType == ExpressionType.ConvertChecked))
+                expr = u.Operand;
+
+            switch (expr)
+            {
+                case MemberExpression member when member.Expression is ParameterExpression:
+                    return _dialect.QuoteIdentifier(FindColumn(member.Member.Name).ColumnName);
+
+                case MemberExpression member:
+                    // captured closure value
+                    return AddParameter(EvaluateValue(member));
+
+                case ConstantExpression constant:
+                    return constant.Value == null ? "NULL" : AddParameter(constant.Value);
+
+                case BinaryExpression binary:
+                    return TranslateValueBinary(binary);
+
+                case UnaryExpression notExpr when notExpr.NodeType == ExpressionType.Not:
+                    return $"NOT ({TranslateValueExpression(notExpr.Operand)})";
+
+                default:
+                    throw new NotSupportedException(
+                        $"Expression '{expr}' is not supported inside an aggregate selector.");
+            }
+        }
+
+        private string TranslateValueBinary(BinaryExpression binary)
+        {
+            // null comparison
+            if (binary.NodeType == ExpressionType.Equal || binary.NodeType == ExpressionType.NotEqual)
+            {
+                if (IsNullConstant(binary.Right))
+                    return $"{TranslateValueExpression(binary.Left)} IS {(binary.NodeType == ExpressionType.Equal ? "NULL" : "NOT NULL")}";
+                if (IsNullConstant(binary.Left))
+                    return $"{TranslateValueExpression(binary.Right)} IS {(binary.NodeType == ExpressionType.Equal ? "NULL" : "NOT NULL")}";
+            }
+
+            var left = TranslateValueExpression(binary.Left);
+            var right = TranslateValueExpression(binary.Right);
+
+            string op;
+            switch (binary.NodeType)
+            {
+                case ExpressionType.Add: op = "+"; break;
+                case ExpressionType.Subtract: op = "-"; break;
+                case ExpressionType.Multiply: op = "*"; break;
+                case ExpressionType.Divide: op = "/"; break;
+                case ExpressionType.Modulo: op = "%"; break;
+                case ExpressionType.Equal: op = "="; break;
+                case ExpressionType.NotEqual: op = "<>"; break;
+                case ExpressionType.LessThan: op = "<"; break;
+                case ExpressionType.LessThanOrEqual: op = "<="; break;
+                case ExpressionType.GreaterThan: op = ">"; break;
+                case ExpressionType.GreaterThanOrEqual: op = ">="; break;
+                case ExpressionType.AndAlso: op = "AND"; break;
+                case ExpressionType.OrElse: op = "OR"; break;
+                default:
+                    throw new NotSupportedException(
+                        $"Operator '{binary.NodeType}' is not supported inside an aggregate selector.");
+            }
+
+            return $"({left} {op} {right})";
+        }
+
+        private static bool IsNullConstant(Expression expr)
+        {
+            if (expr is ConstantExpression c && c.Value == null) return true;
+            if (expr is UnaryExpression u && u.NodeType == ExpressionType.Convert) return IsNullConstant(u.Operand);
+            return false;
         }
 
         /// <summary>
@@ -522,5 +631,6 @@ namespace LiteSql.Sql
     {
         public string ColumnName { get; set; }
         public string PropertyName { get; set; }
+        public bool IsLiteral { get; set; }
     }
 }

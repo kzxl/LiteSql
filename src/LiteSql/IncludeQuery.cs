@@ -53,7 +53,7 @@ namespace LiteSql
         public IncludeQuery<T> OrderBy<TKey>(Expression<Func<T, TKey>> keySelector)
         {
             _orderByClauses = new List<string>();
-            _orderByClauses.Add($"[{Table<T>.ExtractColumnName(keySelector)}] ASC");
+            _orderByClauses.Add($"{_context.Dialect.QuoteIdentifier(Table<T>.ExtractColumnName(keySelector))} ASC");
             return this;
         }
 
@@ -63,7 +63,7 @@ namespace LiteSql
         public IncludeQuery<T> OrderByDescending<TKey>(Expression<Func<T, TKey>> keySelector)
         {
             _orderByClauses = new List<string>();
-            _orderByClauses.Add($"[{Table<T>.ExtractColumnName(keySelector)}] DESC");
+            _orderByClauses.Add($"{_context.Dialect.QuoteIdentifier(Table<T>.ExtractColumnName(keySelector))} DESC");
             return this;
         }
 
@@ -74,7 +74,7 @@ namespace LiteSql
         {
             if (_orderByClauses == null)
                 throw new InvalidOperationException("ThenBy must be called after OrderBy or OrderByDescending.");
-            _orderByClauses.Add($"[{Table<T>.ExtractColumnName(keySelector)}] ASC");
+            _orderByClauses.Add($"{_context.Dialect.QuoteIdentifier(Table<T>.ExtractColumnName(keySelector))} ASC");
             return this;
         }
 
@@ -85,7 +85,7 @@ namespace LiteSql
         {
             if (_orderByClauses == null)
                 throw new InvalidOperationException("ThenByDescending must be called after OrderBy or OrderByDescending.");
-            _orderByClauses.Add($"[{Table<T>.ExtractColumnName(keySelector)}] DESC");
+            _orderByClauses.Add($"{_context.Dialect.QuoteIdentifier(Table<T>.ExtractColumnName(keySelector))} DESC");
             return this;
         }
 
@@ -280,7 +280,7 @@ namespace LiteSql
             if (fkValues.Count == 0) return;
 
             var relatedMapping = MappingCache.GetMapping(assoc.OtherType);
-            var quotedTable = SqlGenerator.QuoteTableName(relatedMapping.TableName);
+            var quotedTable = SqlGenerator.QuoteTableName(relatedMapping.TableName, _context.Dialect);
 
             var dp = new DynamicParameters();
             var paramNames = new List<string>();
@@ -290,7 +290,7 @@ namespace LiteSql
                 dp.Add($"@fk{i}", fkValues[i]);
             }
 
-            var sql = $"SELECT * FROM {quotedTable} WHERE [{assoc.OtherKey}] IN ({string.Join(", ", paramNames)})";
+            var sql = $"SELECT * FROM {quotedTable} WHERE {_context.Dialect.QuoteIdentifier(assoc.OtherKey)} IN ({string.Join(", ", paramNames)})";
             _context.EnsureConnectionOpen();
             var related = _context.Connection.Query(assoc.OtherType, sql, dp,
                 transaction: _context.Transaction, commandTimeout: _context.CommandTimeout).ToList();
@@ -326,7 +326,7 @@ namespace LiteSql
             if (fkValues.Count == 0) return;
 
             var relatedMapping = MappingCache.GetMapping(assoc.OtherType);
-            var quotedTable = SqlGenerator.QuoteTableName(relatedMapping.TableName);
+            var quotedTable = SqlGenerator.QuoteTableName(relatedMapping.TableName, _context.Dialect);
 
             var dp = new DynamicParameters();
             var paramNames = new List<string>();
@@ -336,7 +336,7 @@ namespace LiteSql
                 dp.Add($"@fk{i}", fkValues[i]);
             }
 
-            var sql = $"SELECT * FROM {quotedTable} WHERE [{assoc.OtherKey}] IN ({string.Join(", ", paramNames)})";
+            var sql = $"SELECT * FROM {quotedTable} WHERE {_context.Dialect.QuoteIdentifier(assoc.OtherKey)} IN ({string.Join(", ", paramNames)})";
             await _context.EnsureConnectionOpenAsync(ct).ConfigureAwait(false);
             var related = (await _context.Connection.QueryAsync(assoc.OtherType, sql, dp,
                 transaction: _context.Transaction, commandTimeout: _context.CommandTimeout)
@@ -374,12 +374,12 @@ namespace LiteSql
             if (pkValues.Count == 0) return;
 
             var childMapping = MappingCache.GetMapping(assoc.OtherType);
-            var quotedTable = SqlGenerator.QuoteTableName(childMapping.TableName);
+            var quotedTable = SqlGenerator.QuoteTableName(childMapping.TableName, _context.Dialect);
             var dp = new DynamicParameters();
             var pn = new List<string>();
             for (int i = 0; i < pkValues.Count; i++) { pn.Add($"@ck{i}"); dp.Add($"@ck{i}", pkValues[i]); }
 
-            var sql = $"SELECT * FROM {quotedTable} WHERE [{assoc.OtherKey}] IN ({string.Join(", ", pn)})";
+            var sql = $"SELECT * FROM {quotedTable} WHERE {_context.Dialect.QuoteIdentifier(assoc.OtherKey)} IN ({string.Join(", ", pn)})";
             _context.EnsureConnectionOpen();
             var children = _context.Connection.Query(assoc.OtherType, sql, dp,
                 transaction: _context.Transaction, commandTimeout: _context.CommandTimeout).ToList();
@@ -425,12 +425,12 @@ namespace LiteSql
             if (pkValues.Count == 0) return;
 
             var childMapping = MappingCache.GetMapping(assoc.OtherType);
-            var quotedTable = SqlGenerator.QuoteTableName(childMapping.TableName);
+            var quotedTable = SqlGenerator.QuoteTableName(childMapping.TableName, _context.Dialect);
             var dp = new DynamicParameters();
             var pn = new List<string>();
             for (int i = 0; i < pkValues.Count; i++) { pn.Add($"@ck{i}"); dp.Add($"@ck{i}", pkValues[i]); }
 
-            var sql = $"SELECT * FROM {quotedTable} WHERE [{assoc.OtherKey}] IN ({string.Join(", ", pn)})";
+            var sql = $"SELECT * FROM {quotedTable} WHERE {_context.Dialect.QuoteIdentifier(assoc.OtherKey)} IN ({string.Join(", ", pn)})";
             await _context.EnsureConnectionOpenAsync(ct).ConfigureAwait(false);
             var children = (await _context.Connection.QueryAsync(assoc.OtherType, sql, dp,
                 transaction: _context.Transaction, commandTimeout: _context.CommandTimeout)
@@ -500,13 +500,13 @@ namespace LiteSql
         private (string sql, DynamicParameters dp) BuildSql(
             EntityMapping mapping, Expression<Func<T, bool>> predicate)
         {
-            var selectAll = SqlGenerator.GenerateSelectAll(mapping);
+            var selectAll = SqlGenerator.GenerateSelectAll(mapping, _context.Dialect);
             IDictionary<string, object> parameters = null;
 
             string fullSql;
             if (predicate != null)
             {
-                var builder = new WhereBuilder(mapping);
+                var builder = new WhereBuilder(mapping, _context.Dialect);
                 var (whereSql, whereParams) = builder.Build(predicate);
                 parameters = whereParams;
                 fullSql = $"{selectAll} WHERE {whereSql}";
@@ -520,13 +520,13 @@ namespace LiteSql
             if (_orderByClauses != null && _orderByClauses.Count > 0)
                 fullSql += $" ORDER BY {string.Join(", ", _orderByClauses)}";
 
-            // Pagination
-            var isSqlite = _context.Connection.GetType().Name
-                .IndexOf("sqlite", StringComparison.OrdinalIgnoreCase) >= 0;
+            // Pagination (dialect-aware)
+            var provider = _context.Dialect.ProviderName;
+            var usesLimit = provider == "SQLite" || provider == "MySQL" || provider == "PostgreSQL";
 
             if (_skip.HasValue || _take.HasValue)
             {
-                if (isSqlite)
+                if (usesLimit)
                 {
                     if (_take.HasValue) fullSql += $" LIMIT {_take.Value}";
                     else fullSql += " LIMIT -1";
