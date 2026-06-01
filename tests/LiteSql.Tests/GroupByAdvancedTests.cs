@@ -12,6 +12,7 @@ namespace LiteSql.Tests
     /// <summary>
     /// Advanced GroupBy tests covering edge cases, NULL handling, and complex scenarios
     /// </summary>
+    [Collection("SqlServer")]
     public class GroupByAdvancedTests : IDisposable
     {
         private readonly SqlConnection _connection;

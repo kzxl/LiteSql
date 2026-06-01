@@ -11,6 +11,7 @@ namespace LiteSql.Tests
     /// Tests for ToSql() debug method on GroupByQuery.
     /// Inspired by FreeSql's ToSql() pattern.
     /// </summary>
+    [Collection("SqlServer")]
     public class ToSqlDebugTests : IDisposable
     {
         private readonly SqlConnection _connection;

@@ -13,6 +13,7 @@ namespace LiteSql.Tests
     /// GroupBy tests for SQL Server - the primary target database.
     /// SQL Server returns Int32 for INT columns, so anonymous types work perfectly.
     /// </summary>
+    [Collection("SqlServer")]
     public class SqlServerGroupByTests : IDisposable
     {
         private readonly SqlConnection _connection;

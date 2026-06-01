@@ -124,9 +124,9 @@ namespace LiteSql.Tests
 
             // Assert
             Assert.Contains("SELECT", sql);
-            Assert.Contains("FROM [Orders] AS t1", sql);
-            Assert.Contains("INNER JOIN [Customers] AS t2", sql);
-            Assert.Contains("ON t1.[CustomerId] = t2.[Id]", sql);
+            Assert.Contains("FROM \"Orders\" AS t1", sql);
+            Assert.Contains("INNER JOIN \"Customers\" AS t2", sql);
+            Assert.Contains("ON t1.\"CustomerId\" = t2.\"Id\"", sql);
         }
 
         [Fact]

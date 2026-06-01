@@ -270,7 +270,7 @@ namespace LiteSql.Tests
                 .ToList();
 
             // Assert
-            Assert.Equal(6, result.Count); // 5 customers, but customer 3 has orders in 2 years
+            Assert.Equal(5, result.Count); // 5 distinct (CustomerId, Year) combinations in the seed data
             Assert.Contains(result, r => r.CustomerId == 1 && r.Year == 2026 && r.Count == 3);
             Assert.Contains(result, r => r.CustomerId == 3 && r.Year == 2025 && r.Count == 2);
         }
@@ -345,10 +345,11 @@ namespace LiteSql.Tests
                 .ToList();
 
             // Assert
-            Assert.Equal(3, result.Count); // Customers 1 (450), 2 (425), 3 (750), 5 (1000)
+            Assert.Equal(4, result.Count); // Customers 1 (450), 2 (425), 3 (750), 5 (1000)
             Assert.Contains(result, r => r.CustomerId == 1);
             Assert.Contains(result, r => r.CustomerId == 2);
             Assert.Contains(result, r => r.CustomerId == 3);
+            Assert.Contains(result, r => r.CustomerId == 5);
         }
 
         [Fact]

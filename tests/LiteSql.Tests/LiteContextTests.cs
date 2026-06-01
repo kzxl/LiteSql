@@ -285,7 +285,7 @@ namespace LiteSql.Tests
             }
 
             var logOutput = logWriter.ToString();
-            Assert.Contains("INSERT INTO [Items]", logOutput);
+            Assert.Contains("INSERT INTO \"Items\"", logOutput);
             Assert.Contains("@Name", logOutput);
         }
 
