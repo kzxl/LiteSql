@@ -25,7 +25,7 @@
 - 🚀 **AsNoTracking** — Skip change tracking for read-only queries
 - 📊 **Dirty Update** — Only changed columns are UPDATEd, reducing data transfer
 - 🎯 **Same mapping attributes** — `[Table]`, `[Column]` with identical signatures
-- 🔌 **Multi-database** — SQL Server and SQLite, extensible to others
+- 🔌 **Multi-database** — SQL Server, SQLite, MySQL, PostgreSQL (dialect-aware quoting, pagination, UPSERT)
 - 📦 **.NET Standard 2.0** — Works on both .NET Framework and .NET Core / .NET 5+
 - 🛠️ **Code Generator** — Generate entities from SQL Server database or `.dbml` files
 - 🧪 **204 tests** — Unit, integration & performance tests with SQLite in-memory
@@ -67,13 +67,16 @@ litesql-codegen DataClasses1.dbml -n MyNamespace -o Models/DataClasses1.cs
 
 ```
 litesql-codegen <input.dbml> [options]          # from DBML file
-litesql-codegen -c <connection-string> [options] # from SQL Server
+litesql-codegen -c <connection-string> [options] # from a live database
 
 Options:
-  -o, --output <path>       Output .cs file path
+  -o, --output <path>       Output .cs file path (or directory with --split)
   -n, --namespace <ns>      Target namespace (default: Models)
-  -c, --connection <cs>     SQL Server connection string
+  -c, --connection <cs>     Database connection string
+  -p, --provider <name>     DB provider: sqlserver (default), mysql, postgresql, sqlite
       --context <name>      Override context class name
+      --split               One file per entity
+      --single-file         All entities in one file (default)
   -h, --help                Show help
 ```
 
@@ -233,6 +236,225 @@ var page = db.Products
 
 // Async
 var dtos = await db.Products.SelectAsync(p => new { p.Id, p.Name });
+```
+
+## GroupBy
+
+Server-side aggregation with `GroupBy()` + `Select()`. Works with anonymous types and DTOs:
+
+```csharp
+// Single-column group with aggregates
+var summary = db.Orders
+    .GroupBy(o => o.CustomerId)
+    .Select(g => new {
+        CustomerId = g.Key,
+        OrderCount = g.Count(),
+        Total      = g.Sum(x => x.Amount),
+        Avg        = g.Average(x => x.Amount)
+    })
+    .ToList();
+// → SELECT [CustomerId], COUNT(*) AS [OrderCount], SUM([Amount]) AS [Total], AVG([Amount]) AS [Avg]
+//   FROM [Orders] GROUP BY [CustomerId]
+
+// Multi-column group
+var byStatusYear = db.Orders
+    .GroupBy(o => new { o.Status, o.Year })
+    .Select(g => new { g.Key.Status, g.Key.Year, Count = g.Count() });
+
+// HAVING (filter on aggregates)
+var heavy = db.Orders
+    .GroupBy(o => o.CustomerId)
+    .Where(g => g.Count() > 1 && g.Sum(x => x.Amount) > 400)
+    .Select(g => new { g.Key, Total = g.Sum(x => x.Amount) });
+
+// Conditional count + expression aggregate
+var stats = db.Orders
+    .GroupBy(o => o.CustomerId)
+    .Select(g => new {
+        g.Key,
+        CompletedCount = g.Count(x => x.Status == "Completed"),
+        Weighted       = g.Sum(x => x.Amount * x.Qty)
+    });
+
+// WHERE before GroupBy (filters rows before grouping)
+var completedOnly = db.Orders
+    .AndWhere(o => o.Status == "Completed")
+    .GroupBy(o => o.CustomerId)
+    .Select(g => new { g.Key, Total = g.Sum(x => x.Amount) });
+
+// Async
+var top = await db.Orders
+    .GroupBy(o => o.CustomerId)
+    .SelectAsync(g => new { g.Key, Total = g.Sum(x => x.Amount) });
+```
+
+## Join
+
+Two-table `Join` / `LeftJoin` with a result projection, optional WHERE, and async:
+
+```csharp
+var rows = db.GetTable<Order>()
+    .Join(db.GetTable<Customer>(),
+        o => o.CustomerId,
+        c => c.Id,
+        (o, c) => new { o.Id, Customer = c.Name, o.Amount })
+    .Where((o, c) => c.Country == "VN" && o.Amount > 100)
+    .ToList();
+
+// Left join + async
+var left = await db.GetTable<Order>()
+    .LeftJoin(db.GetTable<OrderDetail>(),
+        o => o.Id,
+        d => d.OrderId,
+        (o, d) => new OrderLineDto { OrderId = o.Id, Sku = d.Sku })
+    .ToListAsync();
+```
+
+### Multi-table joins (3+ tables)
+
+Use `JoinMany` / `LeftJoinMany` to start a chain, then add tables. Lambda parameters are
+positional — the j-th parameter is the j-th joined table:
+
+```csharp
+var rows = db.GetTable<Order>()
+    .JoinMany(db.GetTable<Customer>(), (o, c) => o.CustomerId == c.Id)
+    .Join(db.GetTable<Country>(),      (o, c, ct) => c.CountryId == ct.Id)
+    .Join(db.GetTable<OrderLine>(),    (o, c, ct, l) => l.OrderId == o.Id)
+    .Where((o, c, ct, l) => ct.Name == "Vietnam" && l.Qty >= 2)
+    .Select((o, c, ct, l) => new { o.Id, Customer = c.Name, Country = ct.Name, l.Sku, l.Qty });
+
+// LEFT JOIN steps, DTO projection, and async are all supported:
+var dto = await db.GetTable<Order>()
+    .JoinMany(db.GetTable<Customer>(), (o, c) => o.CustomerId == c.Id)
+    .LeftJoin(db.GetTable<OrderLine>(), (o, c, l) => l.OrderId == o.Id)
+    .SelectAsync((o, c, l) => new OrderReportDto { OrderId = o.Id, Customer = c.Name, Sku = l.Sku });
+```
+
+Supports up to 4 tables out of the box (chain types `JoinChain<T1,T2>` … `JoinChain<T1,T2,T3,T4>`).
+For 5+ tables or subqueries-in-SELECT, use `ExecuteQuery<T>()` / `FromSql<T>()`.
+
+## Conditional Filtering (WhereIf / AndWhere)
+
+Build queries dynamically; filters are accumulated and combined (AND) at the terminal call:
+
+```csharp
+var results = db.Orders
+    .WhereIf(!string.IsNullOrEmpty(status), o => o.Status == status)
+    .WhereIf(minAmount.HasValue, o => o.Amount >= minAmount.Value)
+    .AndWhere(o => o.IsActive)
+    .OrderBy(o => o.Date)
+    .ToList();
+// Only conditions whose flag is true are merged into one SQL WHERE.
+```
+
+## Subqueries (EXISTS / IN)
+
+Correlated subqueries without raw SQL:
+
+```csharp
+// EXISTS — customers that have at least one order
+var withOrders = db.Customers
+    .WhereExists(db.Orders, (c, o) => o.CustomerId == c.Id)
+    .ToList();
+// → SELECT * FROM [Customers] WHERE (EXISTS (SELECT 1 FROM [Orders] AS sq0 WHERE sq0.[CustomerId] = [Customers].[Id]))
+
+// NOT EXISTS — customers with no orders
+var noOrders = db.Customers
+    .WhereNotExists(db.Orders, (c, o) => o.CustomerId == c.Id);
+
+// IN subquery (with optional inner filter)
+var activeCustomers = db.Customers
+    .WhereIn(c => c.Id, db.Orders, o => o.CustomerId, o => o.Status == "Active");
+
+// NOT IN
+var inactive = db.Customers.WhereNotIn(c => c.Id, db.Orders, o => o.CustomerId);
+
+// Subqueries combine with regular predicates
+var result = db.Customers
+    .AndWhere(c => c.IsActive)
+    .WhereExists(db.Orders, (c, o) => o.CustomerId == c.Id)
+    .ToList();
+```
+
+## Graph Insert (parent + children)
+
+Insert a parent and its one-to-many child collections in one transaction; the generated parent
+key is propagated to each child's FK (recursive for nested graphs):
+
+```csharp
+var order = new Order {
+    Code = "ORD-1",
+    Lines = {
+        new OrderLine { Sku = "A", Qty = 2 },
+        new OrderLine { Sku = "B", Qty = 5 }
+    }
+};
+db.InsertGraph(order);          // or: await db.InsertGraphAsync(order)
+// order.Id is set; each line.OrderId is set to order.Id; all inserted in one transaction.
+```
+
+The child collection is declared with an `[Association]` where `ThisKey` is the parent PK and
+`OtherKey` is the child FK:
+
+```csharp
+[Association(ThisKey = "Id", OtherKey = "OrderId")]
+public List<OrderLine> Lines { get; set; } = new();
+```
+
+## Schema Migrations
+
+Code-based migrations with up/down, history tracking, and a dialect-aware `SchemaBuilder`:
+
+```csharp
+public class CreateUsers : Migration
+{
+    public override string Id => "0001_CreateUsers";
+
+    public override void Up(SchemaBuilder s) => s
+        .CreateTable("Users", t => {
+            t.Int("Id").Identity().PrimaryKey();
+            t.String("Username", 100).NotNull().Unique();
+            t.String("FullName", 200);
+        })
+        .CreateIndex("Users", "IX_Users_Username", unique: true, "Username");
+
+    public override void Down(SchemaBuilder s) => s
+        .DropIndex("Users", "IX_Users_Username")
+        .DropTable("Users");
+}
+
+// Apply (idempotent — applied migrations are tracked in __LiteSqlMigrations and skipped on re-run)
+var runner = new MigrationRunner(connection, new SqlServerDialect());
+runner.MigrateUp(new Migration[] { new CreateUsers() });
+
+// Rollback + inspect history
+runner.MigrateDown(new CreateUsers());
+var applied = runner.GetAppliedIds();
+```
+
+`SchemaBuilder` supports `CreateTable`/`DropTable`, `AddColumn`/`DropColumn`,
+`CreateIndex`/`DropIndex`, and raw `Sql()`. Each migration runs in its own transaction.
+
+## Optimistic Concurrency
+
+Mark a column `[Column(IsVersion = true)]`. Updates add the loaded version to the WHERE and bump
+integral versions; a no-op update (row changed elsewhere) throws `ConcurrencyException`:
+
+```csharp
+[Column(Name = "RowVersion", IsVersion = true)]
+public int RowVersion { get; set; }
+
+try { db.SubmitChanges(); }
+catch (ConcurrencyException) { /* reload + retry */ }
+```
+
+## Value Converters (read + write)
+
+```csharp
+db.Converters.Add<OrderStatus, string>(
+    toDb:   v => v.ToString(),
+    fromDb: v => (OrderStatus)Enum.Parse(typeof(OrderStatus), v));
+// Applied automatically on INSERT/UPDATE and on SELECT (via Dapper type handler).
 ```
 
 ## FK Navigation (Auto-Load)
@@ -479,11 +701,9 @@ LiteSql is designed as a **lightweight L2S replacement**, not a full-featured OR
 
 | Category | Feature | Description |
 |---|---|---|
-| **Schema** | Migration | No `Add-Migration` / `Update-Database`. Schema managed externally (SQL scripts, SSMS). CodeGen is DB → Code only |
-| **Performance** | SqlBulkCopy | Has batched `BulkInsert()` with INSERT VALUES. No `SqlBulkCopy` for SQL Server yet |
+| **Performance** | SqlBulkCopy | Has batched `BulkInsert()` with chunked INSERT VALUES. No `SqlBulkCopy` for SQL Server yet |
 | **Performance** | Split Query | No `AsSplitQuery()`. `Include()` uses batch IN queries (good enough for most cases) |
-| **LINQ** | Full LINQ Provider | Has `Where`, `FirstOrDefault`, `Single`, `SingleOrDefault`, `First`, `Any`, `Count`, `OrderBy`, `ThenBy`, `Skip`, `Take`, `Select`, `Max`, `Min`, `Sum`, `Average`, `Distinct`, `Contains/IN`. No `GroupBy`, `Join` |
-| **ORM** | Graph Insert/Update | Cannot insert/update an entire object graph (parent + children) in one call |
+| **LINQ** | Full LINQ Provider | Has `Where`, `WhereIf`, `AndWhere`, `FirstOrDefault`, `Single`, `SingleOrDefault`, `First`, `Any`, `Count`, `OrderBy`, `ThenBy`, `Skip`, `Take`, `Select`, `Max`, `Min`, `Sum`, `Average`, `Distinct`, `Contains/IN`, `GroupBy` (HAVING, multi-column, conditional/expression aggregates), `Join`/`LeftJoin` (2-table) and `JoinMany`/`LeftJoinMany` (up to 4 tables, WHERE + async), correlated `WhereExists`/`WhereIn` subqueries. No 5+ table joins or subqueries inside SELECT |
 | **ORM** | Lazy Loading | No proxy-based or explicit lazy loading |
 
 ### By Design (Won't Implement)
@@ -492,7 +712,7 @@ LiteSql is designed as a **lightweight L2S replacement**, not a full-featured OR
 |---|---|
 | Full IQueryable Provider | Complexity too high. Use `ExecuteQuery<T>()` for complex queries |
 | Database-first Migration | Use SQL scripts or external tools (DbUp, FluentMigrator) |
-| Global Query Filters | Can be worked around with `Where()` or raw SQL |
+| Subqueries / 3+ table joins | Use `ExecuteQuery<T>()` / `FromSql<T>()` for complex SQL |
 
 ---
 
@@ -530,15 +750,23 @@ LiteSql is designed as a **lightweight L2S replacement**, not a full-featured OR
 - [x] **Phase 25** — Repository Pattern (IRepository<T>, Repository<T>)
 - [x] **Phase 26** — Value Converters (model⇔database type conversion)
 - [x] **Phase 27** — Contains/IN clause verification + WhereBuilder improvements
+- [x] **Phase 28** — GroupBy (single/multi-column, HAVING, conditional Count, expression aggregates, anonymous-type projection)
+- [x] **Phase 29** — Join / LeftJoin (2-table, WHERE predicate over both entities, sync + async)
+- [x] **Phase 30** — Dialect-aware query path (SQL Server, SQLite, MySQL, PostgreSQL quoting/pagination/UPSERT)
+- [x] **Phase 31** — WhereIf / AndWhere deferred predicate accumulation
+- [x] **Phase 32** — LIKE wildcard escaping, multi-DB CodeGen (`--provider`), convention PK detection, composite-key bulk ops, value-converter read path, real optimistic concurrency
 
-All 27 phases complete! 🎉
+All phases complete! 🎉
+
+- [x] **Phase 33** — Correlated subqueries (`WhereExists`/`WhereNotExists`/`WhereIn`/`WhereNotIn`)
+- [x] **Phase 34** — Graph insert (`InsertGraph`/`InsertGraphAsync`, parent + child collections, one transaction)
+- [x] **Phase 35** — Schema migrations (`Migration`, `SchemaBuilder`, `MigrationRunner` with history + rollback)
 
 ### Not Planned
 
 | Feature | Reason |
 |---|---|
 | Full IQueryable / LINQ Provider | Complexity too high for micro ORM. Use `ExecuteQuery<T>()` for complex SQL |
-| Schema Migration | Use external tools: DbUp, FluentMigrator, or SQL scripts |
 | Lazy Loading (proxy generation) | Over-engineering, EF Core also recommends avoiding it |
 | Fluent Mapping API | Attribute mapping + convention is sufficient |
 | Many-to-many relationships | Rare in current codebase. Handle with raw SQL or junction table queries |
@@ -623,7 +851,7 @@ LiteSql được thiết kế là **thay thế nhẹ cho L2S**, không phải OR
 |---|---|---|
 | **Schema** | Migration | Không có migration. Schema quản lý bằng SQL scripts bên ngoài |
 | **Hiệu năng** | SqlBulkCopy | Có batched `BulkInsert()` (INSERT VALUES). Chưa có `SqlBulkCopy` |
-| **LINQ** | Full LINQ | Có `Where`, `FirstOrDefault`, `Single`, `SingleOrDefault`, `First`, `Any`, `Count`, `OrderBy`, `ThenBy`, `Skip`, `Take`, `Select`, aggregates, `Contains/IN`. Chưa có `GroupBy`, `Join` |
+| **LINQ** | Full LINQ | Có `Where`, `WhereIf`, `AndWhere`, `FirstOrDefault`, `Single`, `SingleOrDefault`, `First`, `Any`, `Count`, `OrderBy`, `ThenBy`, `Skip`, `Take`, `Select`, aggregates, `Contains/IN`, `GroupBy` (HAVING, multi-column, conditional/expression aggregate), `Join`/`LeftJoin` (2 bảng, WHERE + async). Chưa có subquery, join 3+ bảng |
 | **ORM** | Graph Object | Không insert/update cả cây object (parent + children) |
 | **ORM** | Lazy Loading | Không có lazy loading |
 
