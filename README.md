@@ -1,9 +1,20 @@
 # LiteSql
 
+> [!WARNING]
+> ### ⚠️ REPOSITORY ARCHIVED & MERGED INTO ZERODATA
+> **LiteSql** has officially been merged into **[ZeroData](https://github.com/kzxl/ZeroData)** as **`ZeroData.Sql`** and **`ZeroData.Sql.CodeGen`**.
+> Active development, bug fixes, multi-database dialects (SQL Server, SQLite, MySQL, PostgreSQL), and official releases are now maintained under **[`kzxl/ZeroData`](https://github.com/kzxl/ZeroData)**.
+> 
+> Please use or migrate your dependencies to:
+> ```bash
+> dotnet add package ZeroData.Sql
+> ```
+
 > A lightweight LINQ to SQL replacement for .NET Core, powered by Dapper.
 
 [![.NET Standard 2.0](https://img.shields.io/badge/.NET%20Standard-2.0-blue)](https://docs.microsoft.com/en-us/dotnet/standard/net-standard)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+[![Status: Merged into ZeroData](https://img.shields.io/badge/Status-Merged%20into%20ZeroData-orange.svg)](https://github.com/kzxl/ZeroData)
 
 ---
 
